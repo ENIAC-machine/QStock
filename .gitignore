@@ -1,0 +1,10 @@
+#To ignore all the data objects
+*.csv
+*.gz
+*.bz2
+*.sql
+
+#self-explanatory
+auth_token.txt
+.*
+!/.gitignore
