@@ -1,4 +1,3 @@
-import argparse
 import os
 import sys
 import numpy as np
@@ -10,7 +9,12 @@ import torch.nn as nn
 from itertools import islice
 from corus import load_lenta, load_lenta2, load_mokoron, load_buriy_news, load_buriy_webhose
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
+
+from transformers import (
+        AutoTokenizer, AutoModelForSequenceClassification, AdamW,
+        PatchTSTConfig, PatchTSTForPrediction
+        )
+
 from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
 
@@ -34,7 +38,7 @@ class Abstract_Fin_Dataset(Dataset, ABCMeta):
 
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data'),
-                 batch_size: int = 32,
+                 batch_size: int | None = None,
                  unified_file_nm: str = 'all_data.csv',
                  load_from_file: bool = False,
                  delete_old: bool = True,
@@ -66,7 +70,7 @@ class Abstract_Fin_Dataset(Dataset, ABCMeta):
         ...
 
     def __len__(self) -> int:
-        return int(np.ceil(self.num_elements / self.batch_size)) 
+        return self.num_elements
 
     def __iter__(self) -> list[int]:
         for idx in range(0, self.num_elements, self.batch_size):
@@ -221,35 +225,19 @@ class News_Dataset(Abstract_Fin_Dataset):
         return None 
 
 
-    def __getitem__(self, idxs: int | list[int]) -> tuple[Any]:
-        return tuple(pd.read_csv(self.unified_file_nm, skip_rows=idx, nrows=1).iloc[0, :])
-
-
-
-#TODO: refactor the slop below into something that actually works
+    def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
+        return pd.read_csv(self.unified_file_nm, skip_rows=idx[0], nrows=len(idx)).iloc[[idx], :].to_list()
 
 class Abstract_Sentiment_Model(nn.Module, ABCMeta):
 
-    def __init__(self, model_name: str, *args, **kwargs) -> None:
+    def __init__(self,
+                 model_name: str,
+                 num_labels: int,
+                 *args, **kwargs) -> None:
 
         super().__init__()
 
         self.model_name = model_name
-
-
-    @abstractmethod
-    def forward(self, *args, **kwargs) -> Any:
-        ...
-
-class Russian_Sentiment_Model(Abstract_Sentiment_Model):
-    
-    def __init__(self,
-                 model_name: str = '',
-                 num_labels: int= 3
-                 ) -> None:
-
-        super().__init__()
-        
         self.transformer = AutoModelForSequenceClassification.from_pretrained(
             model_name,
             num_labels=num_labels
@@ -257,11 +245,32 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
        
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def forward(self,
-                input_ids: Iterable[int],
-                attention_mask,
-                labels=None
-                ):
+    #no shit Sherlock
+    @abstractmethod
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        ...
+
+class Russian_Sentiment_Model(Abstract_Sentiment_Model):
+    
+    def __init__(self,
+                 model_name: str = "blanchefort/rubert-base-cased-sentiment",
+                 num_labels: int = 3
+                 ) -> None:
+        '''
+        Inputs:
+            model_name: str - name of the model to load
+            num_labels: int - number of labels to expect from the model, default is 3,
+                which corresponds to positive-neutral-negative
+
+        '''
+
+        super().__init__()
+        
+        def forward(self,
+                    input_ids: Iterable[int],
+                    attention_mask: torch.Tensor,
+                    labels=None
+                    ) -> torch.Tensor:
         
         '''
         Forward pass. If labels are provided, returns loss and logits.
@@ -279,7 +288,7 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
         else:
             return outputs.logits
 
-    def predict(self, texts: Iterable[str], device: str = 'cpu'):
+    def predict(self, texts: Iterable[str], device: str = 'cpu') -> torch.Tensor:
         '''
         Run inference on a list of texts.
         Returns predicted class indices and probabilities.
@@ -297,149 +306,278 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
             logits = self.forward(encodings['input_ids'], encodings['attention_mask'])
             probs = torch.softmax(logits, dim=-1)
             preds = torch.argmax(probs, dim=-1)
-        return preds.cpu().numpy(), probs.cpu().numpy()
+        return preds, probs
+
+class Quantum_Encoder(nn.Module):
+
+    def __init__(self,
+                 embed_size: int,
+                 encoder_type: str = 'Amplitude',
+                 wires: Iterable | None = None,
+                 device: str = 'default.qubit',
+                 pad_val: int | float | complex = 0,
+                 out: bool = False) -> None:
+
+        '''
+        Wrapper class for encoding via pennylane functions
+
+        Inputs:
+            features: Sequence - classical feature values to encode
+            embed_size: int - size of the output embedding vector
+            encoder_type: str - type of encoding scheme, currently supported are 'Amplitude' for amplitude encoding, 'Phase' for phase encoding and 'QAOA' for the encdoing strategy inspired by the QAOA
+            wires: Iterable | None - wires (qubits) to encode in the quantum circuit
+            pad_val: int | float | complex - value to pad the classical vector with
+        Outputs:
+            None
+
+        '''
+
+        #TODO: add assert statements
+
+        super().__init__()
+
+        #initialize the simulator
+        self.wires = wires
+        self.device = device
+        self.dev = qml.device(self.device, wires=self.wires)
+        
+        self.encoder_type = encoder_type
+        self.embed_size = embed_size
+        self.pad_val = pad_val
+        self.out = out
+        self.circuit = None
+
+    def _init_circuit(self,
+                     weights: Sequence | None = None
+                     ) -> Callable:
+        ''' 
+        
+        Initialize the circuit for the embedding
+        
+        Inputs:
+            None
+
+        Outputs:
+            circuit
+        
+        '''
+
+        pad_features = lambda features, wires, pad_val: list(features) + [pad_val]*(len(wires) - len(features))
+    
+
+        match self.encoder_type:
+
+            case 'Amplitude':
+                
+                self.embed_size = 1 << len(bin(self.embed_size).split('b')[-1])
+
+                assert bin(self.embed_size).split('b')[-1].count('1') == 1, "self.embed_size is not a power of 2"
 
 
-def train_model(model, train_loader, val_loader, device, epochs=3, lr=2e-5):
-    optimizer = AdamW(model.parameters(), lr=lr)
-    model.to(device)
+                #here weights are for compatibility, they don't serve any meaningful purpose
+                if self.out:
 
-    for epoch in range(epochs):
-        # Training
-        model.train()
-        total_loss = 0
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
-        for batch in progress_bar:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+                    @qml.qnode(self.dev, interface='torch')
+                    def circuit(features: Sequence,
+                                weights: None = None,
+                                pad_val: int | float | complex = self.pad_val,
+                                **kwargs
+                                ) -> np.ndarray:
 
-            optimizer.zero_grad()
-            loss, logits = model(input_ids, attention_mask, labels)
-            loss.backward()
-            optimizer.step()
+                        qml.AmplitudeEmbedding(features,
+                                               wires=self.wires,
+                                               pad_with=pad_val,
+                                               **kwargs
+                                               )
+                        return qml.state()
+                else:
+                    def circuit(features: Sequence,
+                                weights: None = None,
+                                pad_val: int | float | complex = self.pad_val,
+                                **kwargs
+                                ) -> np.ndarray:
 
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+                        qml.AmplitudeEmbedding(features,
+                                               wires=self.wires,
+                                               pad_with=pad_val,
+                                               **kwargs
+                                               )
+            case 'Phase':
+               
+                if self.out:
+                    @qml.qnode(self.dev, interface='torch')
+                    def circuit(features: Sequence,
+                                weights: str = 'Z', #consider it a hyperparameter
+                                ) -> np.ndarray:
 
-        avg_train_loss = total_loss / len(train_loader)
+                        features = pad_features(features, self.wires, self.pad_val)
+                        qml.AngleEmbedding(features, self.wires, rotation=weights)
+                        
+                        return qml.state()
+                
+                else:
+                    def circuit(features: Sequence,
+                                weights: str = 'Z', #consider it a hyperparameter
+                                ) -> np.ndarray:
 
-        # Validation
-        model.eval()
-        all_preds = []
-        all_labels = []
-        val_loss = 0
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{epochs} [Val]'):
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
+                        features = pad_features(features, self.wires, self.pad_val)
+                        qml.AngleEmbedding(features, self.wires, rotation=weights)
+                     
 
-                loss, logits = model(input_ids, attention_mask, labels)
-                val_loss += loss.item()
-                preds = torch.argmax(logits, dim=-1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+            case 'QAOA':
 
-        avg_val_loss = val_loss / len(val_loader)
-        val_acc = accuracy_score(all_labels, all_preds)
-        print(f'Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f}')
+                if self.out:
 
-    return model
+                    @qml.qnode(self.dev, interface='torch')
+                    def circuit(features : Sequence,
+                                weights: Sequence | None = weights, #here weights are actually trainable params
+                                **kwargs
+                                ) -> np.ndarray:
 
-# -------------------- Main --------------------
-def main():
-    parser = argparse.ArgumentParser(description='Russian Sentiment Analysis with Transformers')
-    parser.add_argument('--train_file', type=str, help='Path to training CSV (columns: text, label)')
-    parser.add_argument('--eval_file', type=str, help='Path to evaluation CSV (optional)')
-    parser.add_argument('--model_name', type=str, default='DeepPavlov/rubert-base-cased',
-                        help='Pre-trained model name from Hugging Face')
-    parser.add_argument('--num_labels', type=int, default=3, help='Number of sentiment classes')
-    parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
-    parser.add_argument('--lr', type=float, default=2e-5, help='Learning rate')
-    parser.add_argument('--max_length', type=int, default=128, help='Max token length')
-    parser.add_argument('--save_dir', type=str, default='./saved_model', help='Directory to save model')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--predict', type=str, help='Text to predict sentiment (if given, runs inference)')
-    args = parser.parse_args()
+                    
+                        weights = nn.Parameter(weights)
+                        features = pad_features(features, self.wires, self.pad_val) 
+                        qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
 
-    # -------------------- Inference only mode --------------------
-    if args.predict:
-        # Load model (if saved, otherwise use pre-trained)
-        model = RussianSentimentModel(args.model_name, args.num_labels)
-        # If a saved model exists, load its weights
-        if os.path.exists(args.save_dir):
-            model.load_state_dict(torch.load(os.path.join(args.save_dir, 'pytorch_model.bin'), map_location='cpu'))
-        model.to(args.device)
-        preds, probs = model.predict([args.predict], device=args.device)
-        label_map = {0: 'negative', 1: 'neutral', 2: 'positive'}  # adjust if needed
-        print(f'Text: {args.predict}')
-        print(f'Predicted sentiment: {label_map[preds[0]]} (confidence: {probs[0][preds[0]]:.4f})')
-        return
+                        return qml.state()
 
-    # -------------------- Training mode --------------------
-    if not args.train_file:
-        print("Error: --train_file is required for training.")
-        return
+                else:
+                    def circuit(features : Sequence,
+                                weights: Sequence | None = weights, #here weights are actually trainable params
+                                **kwargs
+                                ) -> np.ndarray:
 
-    # Load data
-    df = pd.read_csv(args.train_file)
-    if 'text' not in df.columns or 'label' not in df.columns:
-        raise ValueError("CSV must contain 'text' and 'label' columns.")
+                    
+                        weights = nn.Parameter(weights)
+                        features = pad_features(features, self.wires, self.pad_val) 
+                        qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
 
-    # Split into train/val (80/20)
-    from sklearn.model_selection import train_test_split
-    train_texts, val_texts, train_labels, val_labels = train_test_split(
-        df['text'].values, df['label'].values, test_size=0.2, random_state=42
-    )
 
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+            case _:
 
-    # Create datasets and loaders
-    train_dataset = SentimentDataset(train_texts, train_labels, tokenizer, args.max_length)
-    val_dataset = SentimentDataset(val_texts, val_labels, tokenizer, args.max_length)
+                raise NotImplementedError
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+        self.circuit = circuit
 
-    # Initialize model
-    model = RussianSentimentModel(args.model_name, args.num_labels)
+        return circuit
 
-    # Train
-    trained_model = train_model(model, train_loader, val_loader, args.device,
-                                epochs=args.epochs, lr=args.lr)
 
-    # Save model
-    os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(trained_model.state_dict(), os.path.join(args.save_dir, 'pytorch_model.bin'))
-    # Also save tokenizer for later use
-    tokenizer.save_pretrained(args.save_dir)
-    print(f"Model saved to {args.save_dir}")
+    def forward(self, features):
+        if self.circuit:
+            return self.circuit(features)
+        else:
+            raise ValueError("Circuit wasn't initialized")
 
-    # Optional evaluation on separate test file
-    if args.eval_file:
-        df_test = pd.read_csv(args.eval_file)
-        test_dataset = SentimentDataset(df_test['text'].values, df_test['label'].values, tokenizer, args.max_length)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
 
-        trained_model.eval()
-        all_preds = []
-        all_labels = []
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc='Testing'):
-                input_ids = batch['input_ids'].to(args.device)
-                attention_mask = batch['attention_mask'].to(args.device)
-                labels = batch['labels'].to(args.device)
-                logits = trained_model(input_ids, attention_mask)
-                preds = torch.argmax(logits, dim=-1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        print("\nTest Set Results:")
-        print(classification_report(all_labels, all_preds, target_names=['negative', 'neutral', 'positive']))
+class Quantum_Kernel(nn.Module):
 
-if __name__ == '__main__':
-    main()
+    def __init__(self,
+                 layer_type : str = 'SimplifiedTwoDesign',
+                 wires: Iterable = range(5),
+                 layer_config : dict[str : Any] = None,
+                 encoder: Quantum_Encoder = None,
+                 device: str = 'default.qubit',
+                 uncorr_wires: tuple | Iterable[int] = ()
+                 ) -> None:
+
+        super().__init__()
+        self.layer_type = layer_type
+        self.wires = wires
+        self.uncorr_wires = uncorr_wires
+        self.device = device
+
+        self.encoder = encoder
+        
+        self.dev = qml.device(self.device, wires=self.wires) 
+
+        if layer_config is None:
+            layer_config = {'weights' : nn.Parameter(
+                                            torch.Tensor(
+                                                np.random.rand(
+                                                    1, len(self.encoder.wires)-1, 2
+                                                    )
+                                                )
+                                            ),
+                            'initial_layer_weights' : nn.Parameter(
+                                                        torch.Tensor(
+                                                            np.random.rand(
+                                                                len(self.encoder.wires)
+                                                                )
+                                                            )
+                                                        ),
+                            'wires' : self.encoder.wires
+                            }
+
+        self.layer_config = layer_config 
+
+        self.mapping = {'SimplifiedTwoDesign' : qml.SimplifiedTwoDesign,
+                        'StronglyEntangling' : qml.StronglyEntanglingLayers}
+
+
+    def _init_circuit(self) -> Callable:
+
+        @qml.qnode(self.dev, interface='torch')
+        def circuit(features: Sequence) -> np.ndarray | torch.Tensor:
+            corr_features, uncorr_features = [], []
+
+            for idx, feature in enumerate(features):
+                if idx in self.uncorr_wires:
+                    uncorr_features.append(feature)
+                else:
+                    corr_features.append(feature)
+        
+            self.encoder._init_circuit()
+            self.encoder.circuit(corr_features)
+            self.mapping[self.layer_type](**self.layer_config)
+                        
+            for wire, feature in zip(self.uncorr_wires, uncorr_features):
+                qml.RX(feature, wires=wire)
+            
+
+            return qml.state()
+
+
+        self.circuit = circuit
+
+        return self.circuit
+
+    def forward(self,
+                features: Sequence
+                ) -> torch.Tensor:
+    
+        if not self.encoder.circuit:
+            print('Initializing without encoder...')
+
+        if not hasattr(self, 'circuit'):
+            self._init_circuit()
+
+        return self.circuit(features)
+
+#TODO: add modules for time series data processing, uniting data and the main
+
+class PatchTST_Sentiment(PatchTSTForPrediction):
+
+    def __init__(self,
+                 time_series_config: PatchTSTConfig,
+                 news_sentiment_model: Abstract_Sentiment_Model,
+                 news_sentiment_config: dict,
+                 quantum_model: Quantum_Kernel,
+                 quantum_model_config: dict,
+                 dim_post_quantum: int 
+                 ) -> None:
+
+        #TODO: change to a combined sentiment model
+        PatchTSTForPrediction.__init__(self, config=time_series_config)
+
+        self.news_sentiment = news_sentiment_model(**news_sentiment_config)
+        self.quantum_model = quantum_model(**quantum_model_config)
+
+        self.news_fusion
+
+
+
+    def _init_news_fusion(self) -> ...:
+
+
 
 
