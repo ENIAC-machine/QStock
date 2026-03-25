@@ -4,14 +4,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-
+import pennylane as qml
 
 from itertools import islice
 from corus import load_lenta, load_lenta2, load_mokoron, load_buriy_news, load_buriy_webhose
 from torch.utils.data import DataLoader, Dataset
 
 from transformers import (
-        AutoTokenizer, AutoModelForSequenceClassification, AdamW,
+        AutoTokenizer, AutoModelForSequenceClassification, 
         PatchTSTConfig, PatchTSTForPrediction
         )
 
@@ -21,6 +21,8 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Annotated
 from abc import abstractmethod, ABCMeta
+
+DATA_DIR = os.path.join('..', 'data')
 
 #global variable to map preprocessing functions to the files
 func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
@@ -272,21 +274,21 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
                     labels=None
                     ) -> torch.Tensor:
         
-        '''
-        Forward pass. If labels are provided, returns loss and logits.
-        Otherwise returns only logits.
-        '''
+            '''
+            Forward pass. If labels are provided, returns loss and logits.
+            Otherwise returns only logits.
+            '''
 
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
+            outputs = self.transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
 
-        if labels is not None:
-            return outputs.loss, outputs.logits
-        else:
-            return outputs.logits
+            if labels is not None:
+                return outputs.loss, outputs.logits
+            else:
+                return outputs.logits
 
     def predict(self, texts: Iterable[str], device: str = 'cpu') -> torch.Tensor:
         '''
@@ -606,7 +608,7 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
 
     def forward(self,
-                time_series_inputs: Annotated[torch.Tensor, 'batch_size', 'n_time_steps', 'time_series_dim']
+                time_series_inputs: Annotated[torch.Tensor, 'batch_size', 'n_time_steps', 'time_series_dim'],
                 news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 1]
                 ) -> torch.Tensor:
         
@@ -615,10 +617,3 @@ class PatchTST_Quantum_Sentiment(nn.Module):
 
         time_series_out = self.time_series_model(time_series).last_hidden_state #(batch, n_patches, d_model)
         print(time_series_out.shape)
-
-
-news = ['This is good!', 'This is bad!', 'Hello there']
-time_series = []
-
-PatchTST_Quantum_Sentiment()
-
