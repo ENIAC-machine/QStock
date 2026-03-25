@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Annotated
-from abc import abstractmethod, ABCMeta
+from abc import abstractmethod, ABC
 
 DATA_DIR = os.path.join('..', 'data')
 
@@ -36,7 +36,7 @@ func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
                 }
 
 
-class Abstract_Fin_Dataset(Dataset, ABCMeta):
+class Abstract_Fin_Dataset(Dataset, ABC):
 
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data'),
@@ -230,7 +230,7 @@ class News_Dataset(Abstract_Fin_Dataset):
     def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
         return pd.read_csv(self.unified_file_nm, skip_rows=idx[0], nrows=len(idx)).iloc[[idx], :].to_list()
 
-class Abstract_Sentiment_Model(nn.Module, ABCMeta):
+class Abstract_Sentiment_Model(nn.Module, ABC):
 
     def __init__(self,
                  model_name: str,
@@ -266,7 +266,7 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
 
         '''
 
-        super().__init__()
+        super().__init__(model_name, num_labels)
         
         def forward(self,
                     input_ids: Iterable[int],
@@ -477,13 +477,15 @@ class Quantum_Kernel(nn.Module):
                  layer_type : str = 'SimplifiedTwoDesign',
                  wires: Iterable = range(5),
                  layer_config : dict[str : Any] = None,
-                 encoder: Quantum_Encoder = None,
+                 encoder: Quantum_Encoder | None = None,
                  device: str = 'default.qubit',
-                 uncorr_wires: tuple | Iterable[int] = ()
+                 uncorr_wires: tuple | Iterable[int] = tuple(),
+                 n_layers: int = 1
                  ) -> None:
 
         super().__init__()
         self.layer_type = layer_type
+        self.n_layers = n_layers
         self.wires = wires
         self.uncorr_wires = uncorr_wires
         self.device = device
@@ -522,7 +524,7 @@ class Quantum_Kernel(nn.Module):
         def circuit(features: Sequence) -> np.ndarray | torch.Tensor:
             corr_features, uncorr_features = [], []
 
-            for idx, feature in enumerate(features):
+            for idx, feature in enumerate(self.n_layers):
                 if idx in self.uncorr_wires:
                     uncorr_features.append(feature)
                 else:
@@ -582,7 +584,7 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #TODO: change to generalize the integration point
 
         self.sentiment_model = sentiment_model(sentiment_config)
-        self.quantum_model = quantum_model(quantum_model_config)
+        self.quantum_model = quantum_model(**quantum_model_config)
 
         #compare the number of qubits needed to fully encompass the embed dim vs the max allowed register size
         self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1, max_quantum_register_size)
@@ -593,12 +595,23 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         else:
             num_registers = 1
 
-        num_params_quantum_layer = np.prod(quantum_model_config['layer_type'].shape(n_wires=self.n_qubits))
+        print(sum(self.quantum_model.mapping[self.quantum_model.layer_type].\
+                                                                        shape(n_wires=self.n_qubits,
+                                                                              n_layers=1), tuple()))
+
+        num_params_quantum_layer = np.prod(
+                                        sum(
+                                            self.quantum_model.mapping[self.quantum_model.layer_type].\
+                                                                        shape(n_wires=self.n_qubits,
+                                                                              n_layers=1),
+                                            tuple()
+                                            )
+                                        )
 
         #tobe refactored
         self.q_params = nn.Parameter(torch.randn(num_params_quantum_layer,
                                                  self.n_qubits,
-                                                 quantum_model_config['n_layers']
+                                                 self.quantum_model.n_layers
                                                  )
                                      )
 
@@ -612,8 +625,8 @@ class PatchTST_Quantum_Sentiment(nn.Module):
                 news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 1]
                 ) -> torch.Tensor:
         
-        news_embeds_agg = self.sentiment_model(news_inputs).last_hidden_state.mean(dim=-1)
-        print(news_embeds_agg.shape)
+        news_embeds_agg = self.sentiment_model(news_inputs).last_hidden_state #(batch, n_samples, seq_length, embed_size)
+        print(f'News_embeds: {news_embeds_agg.shape}')
 
-        time_series_out = self.time_series_model(time_series).last_hidden_state #(batch, n_patches, d_model)
-        print(time_series_out.shape)
+        time_series_out = self.time_series_model(time_series_inputs).hidden_states[-1] #(batch, n_patches, embed_size, d_model)
+        print(f'Time-series embeds: {time_series_out.shape}')

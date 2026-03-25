@@ -1,134 +1,144 @@
+import sys
 import torch
+import torch.nn as nn
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 
-from models import (Russian_Sentiment_Model,
-                    Quantum_Encoder,
-                    Quantum_Kernel,
-                    PatchTST_Quantum_Sentiment
-                    )  # adjust imports as needed
+# Assume models.py is in the same directory
+sys.path.append('.')
+from models import (
+    PatchTST_Quantum_Sentiment,
+    Quantum_Kernel,
+    Quantum_Encoder,
+    Russian_Sentiment_Model,
+)
+from transformers import PatchTSTConfig, PatchTSTForPrediction
 
-from transformers import PatchTSTConfig
+# ---------- 1. Wrapper for Russian_Sentiment_Model to provide last_hidden_state ----------
+class RussianSentimentWithHidden(Russian_Sentiment_Model):
+    """Extends Russian_Sentiment_Model to return an object with .last_hidden_state.
+    Input shape: (batch, num_articles, seq_len) – token IDs.
+    Output: object with .last_hidden_state of shape (batch, num_articles, seq_len, hidden_dim).
+    """
 
-# --- Synthetic data generation ---
-def create_synthetic_data(num_samples=5000, num_features=7):
-    t = np.arange(num_samples)
-    ts_data = np.zeros((num_samples, num_features))
-    for i in range(num_features):
-        ts_data[:, i] = np.sin(2 * np.pi * t / (i+1) * 10) + 0.2 * np.random.randn(num_samples)
-    # Create simple news texts (one per time step)
-    news_texts = [f"News {i} with {'positive' if i%2==0 else 'negative'} sentiment" for i in range(num_samples)]
-    return ts_data, news_texts
+    def __init__(self, model_name, num_labels):
+        super().__init__()
 
-# --- Dataset ---
-class HybridDataset(Dataset):
-    def __init__(self, ts_data, news_texts, context_len, forecast_horizon):
-        self.ts_data = torch.tensor(ts_data, dtype=torch.float32)
-        self.news_texts = news_texts
-        self.context_len = context_len
-        self.forecast_horizon = forecast_horizon
 
-    def __len__(self):
-        return len(self.ts_data) - self.context_len - self.forecast_horizon + 1
+    def forward(self, input_ids):
+        batch_size, num_articles, seq_len = input_ids.shape
+        input_ids_flat = input_ids.view(batch_size * num_articles, seq_len)
+        attention_mask = torch.ones_like(input_ids_flat)
 
-    def __getitem__(self, idx):
-        past_ts = self.ts_data[idx:idx+self.context_len]
-        future_ts = self.ts_data[idx+self.context_len:idx+self.context_len+self.forecast_horizon]
-        past_news = self.news_texts[idx:idx+self.context_len]
-        return past_ts, future_ts, past_news
+        # Call transformer directly to get hidden states
+        outputs = self.transformer(
+            input_ids=input_ids_flat,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        last_hidden = outputs.hidden_states[-1]          # (batch*num_articles, seq_len, hidden_dim)
+        hidden_dim = last_hidden.shape[-1]
+        last_hidden = last_hidden.view(batch_size, num_articles, seq_len, hidden_dim)
 
-# --- Training parameters ---
-context_len = 336
-forecast_horizon = 96
-num_features = 7
+        class Output:
+            def __init__(self, last_hidden_state):
+                self.last_hidden_state = last_hidden_state
+        return Output(last_hidden)
+
+
+# ---------- 2. Model parameters ----------
 batch_size = 4
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+seq_len = 10               # time series sequence length
+num_features = 5
+prediction_length = 2
+d_model = 8                # hidden dimension for PatchTST
 
-# Generate data
-ts_data, news_texts = create_synthetic_data()
-dataset = HybridDataset(ts_data, news_texts, context_len, forecast_horizon)
-train_size = int(0.7 * len(dataset))
-val_size = int(0.15 * len(dataset))
-test_size = len(dataset) - train_size - val_size
-train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
-
-def collate_fn(batch):
-    past_ts = torch.stack([b[0] for b in batch])
-    future_ts = torch.stack([b[1] for b in batch])
-    past_news = [b[2] for b in batch]
-    return past_ts, future_ts, past_news
-
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
-# --- Model configuration ---
+# Time series config (PatchTST)
 time_series_config = PatchTSTConfig(
+    context_length=seq_len,
+    prediction_length=prediction_length,
+    d_model=d_model,
     num_input_channels=num_features,
-    context_length=context_len,
-    prediction_length=forecast_horizon,
-    patch_length=16,
-    patch_stride=16,
-    d_model=128,
-    num_attention_heads=16,
-    num_hidden_layers=3,
-    dropout=0.2,
+    patch_length=5,
+    num_attention_heads=2,
+    num_hidden_layers=1,
     output_hidden_states=True
-).to_dict()  # Convert to dict for easier passing
+)
 
-sentiment_config = {"model_name": "blanchefort/rubert-base-cased-sentiment", "num_labels": 3}
+# Sentiment model
+sentiment_model = RussianSentimentWithHidden(
+    model_name="blanchefort/rubert-base-cased-sentiment",
+    num_labels=3
+)
+
+actual_hidden_dim = sentiment_model.transformer.config.hidden_size
+sentiment_embed_dim = actual_hidden_dim
+
+# Quantum model parameters
+quantum_dim = 8
+quantum_stride = 2
+quantum_depth = 1
+dim_post_quantum = d_model
+max_quantum_register_size = 5
+
+quantum_encoder = Quantum_Encoder(
+    embed_size=quantum_dim,
+    encoder_type='Amplitude',
+    wires=range(3),
+    device='default.qubit',
+    pad_val=0,
+    out=False
+)
+
 quantum_model_config = {
-    "layer_type": "SimplifiedTwoDesign",
-    "wires": range(5),
-    "encoder": Quantum_Encoder(embed_size=8, wires=range(5), out=True)
+    'layer_type': 'SimplifiedTwoDesign',
+    'wires': range(3),
+    'layer_config': None,
+    'encoder': quantum_encoder,
+    'device': 'default.qubit',
+    'uncorr_wires': ()
 }
 
-model = PatchTST_Quantum_Sentiment(
+# Factory to pass the already instantiated sentiment model to the combined model
+def sentiment_factory(config):
+    return sentiment_model
+
+# ---------- 3. Instantiate the combined model ----------
+combined_model = PatchTST_Quantum_Sentiment(
+    time_series_model=PatchTSTForPrediction,
     time_series_config=time_series_config,
-    sentiment_config=sentiment_config,
-    quantum_model_config=quantum_model_config
-).to(device)
+    sentiment_model=sentiment_factory,
+    sentiment_config={},
+    sentiment_embed_dim=sentiment_embed_dim,
+    quantum_model=Quantum_Kernel,
+    quantum_model_config=quantum_model_config,
+    quantum_dim=quantum_dim,
+    quantum_stride=quantum_stride,
+    quantum_depth=quantum_depth,
+    dim_post_quantum=dim_post_quantum,
+    max_quantum_register_size=max_quantum_register_size
+)
 
-# --- Training loop ---
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = torch.nn.MSELoss()
+print("Combined model instantiated successfully.")
 
-num_epochs = 3
-for epoch in range(num_epochs):
-    model.train()
-    train_loss = 0
-    for past_ts, future_ts, past_news in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-        past_ts = past_ts.to(device)
-        future_ts = future_ts.to(device)
-        # past_news is list of lists; device is not relevant for strings
-        optimizer.zero_grad()
-        pred = model(past_ts, past_news)
-        loss = criterion(pred, future_ts)
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item() * past_ts.size(0)
-    train_loss /= len(train_loader.dataset)
+# ---------- 4. Prepare dummy input ----------
+# Time series input (batch, seq_len, num_features)
+time_series_inputs = torch.randn(batch_size, seq_len, num_features)
 
-    model.eval()
-    val_loss = 0
-    with torch.no_grad():
-        for past_ts, future_ts, past_news in val_loader:
-            past_ts = past_ts.to(device)
-            future_ts = future_ts.to(device)
-            pred = model(past_ts, past_news)
-            val_loss += criterion(pred, future_ts).item() * past_ts.size(0)
-    val_loss /= len(val_loader.dataset)
-    print(f"Epoch {epoch+1}: Train Loss {train_loss:.6f}, Val Loss {val_loss:.6f}")
+# News input – dummy token IDs (batch, num_articles, seq_len_text)
+num_articles = 3
+seq_len_text = 128
+vocab_size = 30522
+news_inputs = torch.randint(0, vocab_size, (batch_size, num_articles, seq_len_text))
 
-# --- Test evaluation ---
-model.eval()
-test_loss = 0
-with torch.no_grad():
-    for past_ts, future_ts, past_news in test_loader:
-        past_ts = past_ts.to(device)
-        future_ts = future_ts.to(device)
-        pred = model(past_ts, past_news)
-        test_loss += criterion(pred, future_ts).item() * past_ts.size(0)
-test_loss /= len(test_loader.dataset)
-print(f"Test Loss: {test_loss:.6f}")
+# ---------- 5. Forward pass ----------
+output = combined_model(time_series_inputs, news_inputs)
+print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
+
+# ---------- 6. Simple backward pass ----------
+target = torch.randn(batch_size, prediction_length)
+loss = nn.MSELoss()(output, target)
+loss.backward()
+print("Backward pass completed. Gradients exist:", any(
+    p.grad is not None for p in combined_model.parameters()
+))
