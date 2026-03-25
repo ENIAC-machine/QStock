@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
 
 from pathlib import Path
-from typing import Callable, Generator, Any, Iterable
+from typing import Callable, Generator, Any, Iterable, Annotated
 from abc import abstractmethod, ABCMeta
 
 #global variable to map preprocessing functions to the files
@@ -555,29 +555,70 @@ class Quantum_Kernel(nn.Module):
 
 #TODO: add modules for time series data processing, uniting data and the main
 
-class PatchTST_Sentiment(PatchTSTForPrediction):
+class PatchTST_Quantum_Sentiment(nn.Module):
 
     def __init__(self,
-                 time_series_config: PatchTSTConfig,
-                 news_sentiment_model: Abstract_Sentiment_Model,
-                 news_sentiment_config: dict,
-                 quantum_model: Quantum_Kernel,
+                 time_series_model: nn.Module,
+                 time_series_config: dict,
+                 sentiment_model: nn.Module,
+                 sentiment_config: dict,
+                 sentiment_embed_dim: int,
+                 quantum_model: nn.Module,
                  quantum_model_config: dict,
-                 dim_post_quantum: int 
+                 quantum_dim: int,
+                 quantum_stride: int,
+                 quantum_depth: int, #depth of the circuit in operations
+                 dim_post_quantum: int,
+                 max_quantum_register_size: int = 5 #max register size in qubits
                  ) -> None:
 
-        #TODO: change to a combined sentiment model
-        PatchTSTForPrediction.__init__(self, config=time_series_config)
+        super().__init__()
 
-        self.news_sentiment = news_sentiment_model(**news_sentiment_config)
-        self.quantum_model = quantum_model(**quantum_model_config)
+        self.time_series_model = time_series_model(time_series_config)
 
-        self.news_fusion
+        self.time_series_proj_dim = time_series_config.d_model
+        self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #TODO: change to generalize the integration point
+
+        self.sentiment_model = sentiment_model(sentiment_config)
+        self.quantum_model = quantum_model(quantum_model_config)
+
+        #compare the number of qubits needed to fully encompass the embed dim vs the max allowed register size
+        self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1, max_quantum_register_size)
+        if self.n_qubits == max_quantum_register_size:
+            num_registers = 0
+            for _ in range((1 << self.n_qubits) - 1, quantum_dim, quantum_stride):
+                num_registers += 1
+        else:
+            num_registers = 1
+
+        num_params_quantum_layer = np.prod(quantum_model_config['layer_type'].shape(n_wires=self.n_qubits))
+
+        #tobe refactored
+        self.q_params = nn.Parameter(torch.randn(num_params_quantum_layer,
+                                                 self.n_qubits,
+                                                 quantum_model_config['n_layers']
+                                                 )
+                                     )
+
+        #post-quantum algorithm projection
+        self.post_proj = nn.Linear(num_registers * (1 << self.n_qubits), self.time_series_proj_dim)
+
+        self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
+
+    def forward(self,
+                time_series_inputs: Annotated[torch.Tensor, 'batch_size', 'n_time_steps', 'time_series_dim']
+                news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 1]
+                ) -> torch.Tensor:
+        
+        news_embeds_agg = self.sentiment_model(news_inputs).last_hidden_state.mean(dim=-1)
+        print(news_embeds_agg.shape)
+
+        time_series_out = self.time_series_model(time_series).last_hidden_state #(batch, n_patches, d_model)
+        print(time_series_out.shape)
 
 
+news = ['This is good!', 'This is bad!', 'Hello there']
+time_series = []
 
-    def _init_news_fusion(self) -> ...:
-
-
-
+PatchTST_Quantum_Sentiment()
 
