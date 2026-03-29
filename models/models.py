@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pennylane as qml
 
 from itertools import islice
@@ -19,7 +20,7 @@ from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
 
 from pathlib import Path
-from typing import Callable, Generator, Any, Iterable, Annotated
+from typing import Callable, Generator, Any, Iterable, Sequence, Annotated
 from abc import abstractmethod, ABC
 
 DATA_DIR = os.path.join('..', 'data')
@@ -313,19 +314,20 @@ class Russian_Sentiment_Model(Abstract_Sentiment_Model):
 class Quantum_Encoder(nn.Module):
 
     def __init__(self,
-                 embed_size: int,
                  encoder_type: str = 'Amplitude',
                  wires: Iterable | None = None,
                  device: str = 'default.qubit',
-                 pad_val: int | float | complex = 0,
-                 out: bool = False) -> None:
+                 pad_val: complex = 0,
+                 out: bool = False,
+                 n_layers: int = 1,
+                 cfg: dict | None = None
+                 ) -> None:
 
         '''
         Wrapper class for encoding via pennylane functions
 
         Inputs:
             features: Sequence - classical feature values to encode
-            embed_size: int - size of the output embedding vector
             encoder_type: str - type of encoding scheme, currently supported are 'Amplitude' for amplitude encoding, 'Phase' for phase encoding and 'QAOA' for the encdoing strategy inspired by the QAOA
             wires: Iterable | None - wires (qubits) to encode in the quantum circuit
             pad_val: int | float | complex - value to pad the classical vector with
@@ -338,19 +340,44 @@ class Quantum_Encoder(nn.Module):
 
         super().__init__()
 
-        #initialize the simulator
-        self.wires = wires
-        self.device = device
-        self.dev = qml.device(self.device, wires=self.wires)
-        
-        self.encoder_type = encoder_type
-        self.embed_size = embed_size
-        self.pad_val = pad_val
-        self.out = out
-        self.circuit = None
+        if isinstance(cfg, dict):
+            self.__dict__.update(cfg)
+
+        else:
+
+            #initialize the simulator
+            self.wires = wires
+            self.n_layers = n_layers
+            self.device = device
+            
+            self.encoder_type = encoder_type
+            self.pad_val = pad_val
+            self.out = out
+            self.circuit: Callable = None
+            self.weights_shape: tuple | None = None
+
+        self.dev = qml.device(self.device, wires=self.wires) 
+
+        match self.encoder_type:
+
+            case 'Amplitude':
+
+                self.weights_shape = tuple() #no weights here
+
+
+            case 'Phase':
+               
+                self.weights_shape = (self.n_layers, len(self.wires))
+
+            case 'QAOA':
+
+                self.weights_shape = qml.QAOAEmbedding(n_layers=self.n_layers,
+                                                       n_wires=len(self.wires)
+                                                       )
+ 
 
     def _init_circuit(self,
-                     weights: Sequence | None = None
+                     weights: Annotated[torch.Tensor, 'n_layers', 'custom_val'] | str | None = None
                      ) -> Callable:
         ''' 
         
@@ -367,6 +394,20 @@ class Quantum_Encoder(nn.Module):
         pad_features = lambda features, wires, pad_val: list(features) + [pad_val]*(len(wires) - len(features))
     
 
+        def cond_decorator(condition:bool,
+                       decorator: Callable[[Callable], Callable]
+                       ) -> Callable:
+            '''
+            Made to call the qml.qnode decorator conditionally
+            '''
+
+
+            if condition:
+                return decorator
+            else:
+                return lambda x: x 
+
+
         match self.encoder_type:
 
             case 'Amplitude':
@@ -375,85 +416,60 @@ class Quantum_Encoder(nn.Module):
 
                 assert bin(self.embed_size).split('b')[-1].count('1') == 1, "self.embed_size is not a power of 2"
 
-
                 #here weights are for compatibility, they don't serve any meaningful purpose
-                if self.out:
+                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
+                def circuit(features: Sequence,
+                            weights: None = None,
+                            pad_val: complex = self.pad_val,
+                            **kwargs
+                            ) -> torch.Tensor:
 
-                    @qml.qnode(self.dev, interface='torch')
-                    def circuit(features: Sequence,
-                                weights: None = None,
-                                pad_val: int | float | complex = self.pad_val,
-                                **kwargs
-                                ) -> np.ndarray:
-
-                        qml.AmplitudeEmbedding(features,
-                                               wires=self.wires,
-                                               pad_with=pad_val,
-                                               **kwargs
-                                               )
+                    qml.AmplitudeEmbedding(features,
+                                           wires=self.wires,
+                                           pad_with=pad_val,
+                                           **kwargs
+                                           )
+                    if self.out:
                         return qml.state()
-                else:
-                    def circuit(features: Sequence,
-                                weights: None = None,
-                                pad_val: int | float | complex = self.pad_val,
-                                **kwargs
-                                ) -> np.ndarray:
-
-                        qml.AmplitudeEmbedding(features,
-                                               wires=self.wires,
-                                               pad_with=pad_val,
-                                               **kwargs
-                                               )
+                    else:
+                        return None
+            
             case 'Phase':
                
-                if self.out:
-                    @qml.qnode(self.dev, interface='torch')
-                    def circuit(features: Sequence,
-                                weights: str = 'Z', #consider it a hyperparameter
-                                ) -> np.ndarray:
+                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
+                def circuit(features: Sequence,
+                            weights: str = 'Z', #consider it a hyperparameter
+                            ) -> torch.Tensor:
 
-                        features = pad_features(features, self.wires, self.pad_val)
-                        qml.AngleEmbedding(features, self.wires, rotation=weights)
-                        
+                    features = pad_features(features, self.wires, self.pad_val)
+                    qml.AngleEmbedding(features, self.wires, rotation=weights)
+                   
+                    if self.out:
                         return qml.state()
-                
-                else:
-                    def circuit(features: Sequence,
-                                weights: str = 'Z', #consider it a hyperparameter
-                                ) -> np.ndarray:
-
-                        features = pad_features(features, self.wires, self.pad_val)
-                        qml.AngleEmbedding(features, self.wires, rotation=weights)
-                     
+                    else:
+                        return None
+            
+                    
 
             case 'QAOA':
+     
+                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
+                def circuit(features : Sequence,
+                            weights: Annotated[torch.Tensor, 'n_layers', Literal['1', '3', '2*n_qubits']] |\
+                                        None = weights, 
+                            **kwargs
+                            ) -> torch.Tensor:
 
-                if self.out:
-
-                    @qml.qnode(self.dev, interface='torch')
-                    def circuit(features : Sequence,
-                                weights: Sequence | None = weights, #here weights are actually trainable params
-                                **kwargs
-                                ) -> np.ndarray:
-
-                    
+                    if weights is None:
                         weights = nn.Parameter(weights)
-                        features = pad_features(features, self.wires, self.pad_val) 
-                        qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
 
+                    features = pad_features(features, self.wires, self.pad_val) 
+                    qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
+                    
+                    if self.out:
                         return qml.state()
-
-                else:
-                    def circuit(features : Sequence,
-                                weights: Sequence | None = weights, #here weights are actually trainable params
-                                **kwargs
-                                ) -> np.ndarray:
-
-                    
-                        weights = nn.Parameter(weights)
-                        features = pad_features(features, self.wires, self.pad_val) 
-                        qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
-
+                    else:
+                        return None
 
             case _:
 
@@ -462,7 +478,6 @@ class Quantum_Encoder(nn.Module):
         self.circuit = circuit
 
         return circuit
-
 
     def forward(self, features):
         if self.circuit:
@@ -474,72 +489,76 @@ class Quantum_Encoder(nn.Module):
 class Quantum_Kernel(nn.Module):
 
     def __init__(self,
-                 layer_type : str = 'SimplifiedTwoDesign',
+                 layer_type : str = 'StronglyEntanglingLayers',
                  wires: Iterable = range(5),
                  layer_config : dict[str : Any] = None,
-                 encoder: Quantum_Encoder | None = None,
+                 encoder: nn.Module | None = None,
                  device: str = 'default.qubit',
-                 uncorr_wires: tuple | Iterable[int] = tuple(),
-                 n_layers: int = 1
+                 n_layers: int = 1,
+                 encoder_config: dict | None = None,
+                 cfg: dict | None = None
                  ) -> None:
 
         super().__init__()
-        self.layer_type = layer_type
-        self.n_layers = n_layers
-        self.wires = wires
-        self.uncorr_wires = uncorr_wires
-        self.device = device
-
-        self.encoder = encoder
         
-        self.dev = qml.device(self.device, wires=self.wires) 
+        if isinstance(cfg, dict):
+            self.__dict__.update(cfg)
+        else:
+            self.encoder = encoder
+            self.encoder_config = encoder_config
+            self.layer_type = layer_type
+            self.n_layers = n_layers
+            self.wires = wires
+            self.device = device
 
-        if layer_config is None:
-            layer_config = {'weights' : nn.Parameter(
-                                            torch.Tensor(
-                                                np.random.rand(
-                                                    1, len(self.encoder.wires)-1, 2
-                                                    )
-                                                )
-                                            ),
-                            'initial_layer_weights' : nn.Parameter(
-                                                        torch.Tensor(
-                                                            np.random.rand(
-                                                                len(self.encoder.wires)
-                                                                )
-                                                            )
-                                                        ),
-                            'wires' : self.encoder.wires
-                            }
+            self.layer_config = layer_config
 
-        self.layer_config = layer_config 
+        self.dev = qml.device(self.device, wires=self.wires)
+        
+        if self.encoder is not None:
+            self.encoder = self.encoder(cfg=self.encoder_config)
 
         self.mapping = {'SimplifiedTwoDesign' : qml.SimplifiedTwoDesign,
-                        'StronglyEntangling' : qml.StronglyEntanglingLayers}
+                        'StronglyEntanglingLayers' : qml.StronglyEntanglingLayers}
+        
 
+        self.weights_shape = self.mapping[self.layer_type].shape(n_layers=self.n_layers,
+                                                                 n_wires=len(self.wires)
+                                                                )
+    def _init_circuit(self,
+                      kernel_weights: Annotated[torch.Tensor, ('n_layers', 'n_wires', 3)] |\
+                                        Annotated[
+                                            Iterable[
+                                                Annotated[torch.Tensor,
+                                                          'n_wires'],
+                                                Annotated[torch.Tensor,
+                                                          ('n_layers',
+                                                          'n_wires - 1',
+                                                          '2')]
+                                                ],
+                                            ('angles for the layer of Pauli-Y rotations',
+                                            'weights for each layer')
+                                            ],
+                      encoder_weights: torch.Tensor | str | None = None
+                      ) -> Callable:
 
-    def _init_circuit(self) -> Callable:
+        #TODO: update for SimplifiedTwoDesign compatibility
+        layer_config = {'weights' : kernel_weights,
+                        'wires' : self.encoder.wires
+                        }
+
+        if self.encoder is not None:
+            self.encoder_circuit = self.encoder._init_circuit(encoder_weights)
 
         @qml.qnode(self.dev, interface='torch')
         def circuit(features: Sequence) -> np.ndarray | torch.Tensor:
-            corr_features, uncorr_features = [], []
+           
+            self.encoder_circuit(features)
 
-            for idx, feature in enumerate(self.n_layers):
-                if idx in self.uncorr_wires:
-                    uncorr_features.append(feature)
-                else:
-                    corr_features.append(feature)
-        
-            self.encoder._init_circuit()
-            self.encoder.circuit(corr_features)
-            self.mapping[self.layer_type](**self.layer_config)
+            #here the number of layers is within the shape of the weights tensor
+            self.mapping[self.layer_type](**layer_config)
                         
-            for wire, feature in zip(self.uncorr_wires, uncorr_features):
-                qml.RX(feature, wires=wire)
-            
-
-            return qml.state()
-
+            return qml.state() #TODO:change to be more flexible
 
         self.circuit = circuit
 
@@ -549,15 +568,10 @@ class Quantum_Kernel(nn.Module):
                 features: Sequence
                 ) -> torch.Tensor:
     
-        if not self.encoder.circuit:
+        if not hasattr(self, 'encoder_circuit'):
             print('Initializing without encoder...')
 
-        if not hasattr(self, 'circuit'):
-            self._init_circuit()
-
         return self.circuit(features)
-
-#TODO: add modules for time series data processing, uniting data and the main
 
 class PatchTST_Quantum_Sentiment(nn.Module):
 
@@ -578,55 +592,93 @@ class PatchTST_Quantum_Sentiment(nn.Module):
 
         super().__init__()
 
-        self.time_series_model = time_series_model(time_series_config)
+        #Time series model initialization
+        self.time_series_model = time_series_model(time_series_config) #init model with config
+        self.time_series_proj_dim = time_series_config.d_model #define the projection dim ,TODO: change to generalize the integration point
+        
 
-        self.time_series_proj_dim = time_series_config.d_model
-        self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #TODO: change to generalize the integration point
-
-        self.sentiment_model = sentiment_model(sentiment_config)
-        self.quantum_model = quantum_model(**quantum_model_config)
+        #Sentiment model initialization
+        self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #projection, TODO: change to generalize the integration point
+        self.sentiment_model = sentiment_model(sentiment_config) #init the model with config
+        
+        #Quantum model initialization
+        self.quantum_model = quantum_model(cfg=quantum_model_config)
+        self.q_encoder_weights = nn.Parameter(
+                                    torch.randn(
+                                        self.quantum_model.encoder.weights_shape
+                                        )
+                                    )
+        print(self.quantum_model.weights_shape)
+        self.q_kernel_weights = nn.Parameter(torch.randn(self.quantum_model.weights_shape))
+        self.quantum_model._init_circuit(encoder_weights=self.q_encoder_weights,
+                                         kernel_weights=self.q_kernel_weights)
+        self.quantum_dim = quantum_dim
+        self.max_quantum_register_size = max_quantum_register_size
+        self.quantum_stride = quantum_stride
+        self.quantum_depth = quantum_depth
+        self.dim_post_quantum = dim_post_quantum
+        
 
         #compare the number of qubits needed to fully encompass the embed dim vs the max allowed register size
-        self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1, max_quantum_register_size)
-        if self.n_qubits == max_quantum_register_size:
-            num_registers = 0
+        self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1,
+                            self.max_quantum_register_size)
+        
+        if self.n_qubits > self.max_quantum_register_size:
+            self.num_registers= 0
             for _ in range((1 << self.n_qubits) - 1, quantum_dim, quantum_stride):
                 num_registers += 1
         else:
-            num_registers = 1
+            self.num_registers = 1
 
-        print(sum(self.quantum_model.mapping[self.quantum_model.layer_type].\
+        #self.quantum_model.mapping holds a mapping from the names of the layers to their pennylane classes
+        num_params_quantum_layer = self.quantum_model.mapping[self.quantum_model.layer_type].\
                                                                         shape(n_wires=self.n_qubits,
-                                                                              n_layers=1), tuple()))
-
-        num_params_quantum_layer = np.prod(
-                                        sum(
-                                            self.quantum_model.mapping[self.quantum_model.layer_type].\
-                                                                        shape(n_wires=self.n_qubits,
-                                                                              n_layers=1),
-                                            tuple()
-                                            )
-                                        )
-
-        #tobe refactored
-        self.q_params = nn.Parameter(torch.randn(num_params_quantum_layer,
-                                                 self.n_qubits,
-                                                 self.quantum_model.n_layers
-                                                 )
-                                     )
-
+                                                                              n_layers=1)
         #post-quantum algorithm projection
-        self.post_proj = nn.Linear(num_registers * (1 << self.n_qubits), self.time_series_proj_dim)
+        self.post_q_proj = nn.Linear(1 << self.n_qubits,
+                                     self.time_series_proj_dim
+                                     )
 
         self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
 
     def forward(self,
                 time_series_inputs: Annotated[torch.Tensor, 'batch_size', 'n_time_steps', 'time_series_dim'],
-                news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 1]
+                news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 'text_len']
                 ) -> torch.Tensor:
         
-        news_embeds_agg = self.sentiment_model(news_inputs).last_hidden_state #(batch, n_samples, seq_length, embed_size)
-        print(f'News_embeds: {news_embeds_agg.shape}')
+        batch_size = time_series_inputs.shape[0]
 
-        time_series_out = self.time_series_model(time_series_inputs).hidden_states[-1] #(batch, n_patches, embed_size, d_model)
-        print(f'Time-series embeds: {time_series_out.shape}')
+        news_embeds = self.sentiment_model(news_inputs).last_hidden_state #(batch, n_samples, text_length, embed_size)
+        news_embeds_agg = news_embeds.mean(dim=(1,2)) #(batch, embed_size)
+        news_embeds_proj = self.sentiment_proj(news_embeds_agg) #(batch, d_model)
+        print(f'News_embeds: {news_embeds_proj.shape}')
+
+        ts_out = self.time_series_model(time_series_inputs).hidden_states[-1] #(batch, n_patches, embed_size, d_model)
+        ts_out_agg = ts_out.mean(dim=(1,2))
+        print(f'Time-series embeds: {ts_out_agg.shape}')
+
+        combined = torch.cat([ts_out_agg, news_embeds_proj], dim=1) #(batch, 2*d_model)
+
+        if combined.shape[1] < self.quantum_dim:
+            pad = torch.zeros(batch_size,
+                              self.quantum_dim - combined.shape[1],
+                              device=combined.device
+                              )
+
+            combined = torch.cat([combined, pad], dim=1)
+        
+        q_outs = [] #quantum_registers' outputs
+        for idr, register in enumerate(range(0, self.num_registers, self.quantum_stride)):
+            to_encode = combined[:, idr: idr+(1 << self.max_quantum_register_size)]
+            to_encode = F.normalize(to_encode, p=2, dim=1)*2*np.pi #normalize to [0, 2pi] to encode
+            q_outs.append(self.quantum_model.forward(to_encode))
+
+        q_outs = torch.cat(q_outs, dim=1).float()
+        print(f'q_outs: {q_outs.shape}') #(batch, )
+        print(q_outs.dtype)
+
+        post_q_outs = self.post_q_proj(q_outs)
+        print(f'post_q_outs: {post_q_outs.shape}')
+        out = self.out_proj(post_q_outs)
+        print(f'out: {out.shape}')
+        return out

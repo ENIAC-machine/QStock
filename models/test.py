@@ -71,33 +71,33 @@ sentiment_model = RussianSentimentWithHidden(
     num_labels=3
 )
 
-actual_hidden_dim = sentiment_model.transformer.config.hidden_size
-sentiment_embed_dim = actual_hidden_dim
+#actual_hidden_dim = sentiment_model.transformer.config.hidden_size
+sentiment_embed_dim = 768 #actual_hidden_dim
 
 # Quantum model parameters
-quantum_dim = 8
+quantum_dim = 15
 quantum_stride = 2
 quantum_depth = 1
 dim_post_quantum = d_model
 max_quantum_register_size = 5
 
-quantum_encoder = Quantum_Encoder(
-    embed_size=quantum_dim,
-    encoder_type='Amplitude',
-    wires=range(3),
-    device='default.qubit',
-    pad_val=0,
-    out=False
-)
-
 quantum_model_config = {
-    'layer_type': 'SimplifiedTwoDesign',
-    'wires': range(3),
+    'layer_type' : 'StronglyEntanglingLayers',
+    'n_layers' : 2,
+    'wires': range(4),
     'layer_config': None,
-    'encoder': quantum_encoder,
+    'encoder': Quantum_Encoder,
     'device': 'default.qubit',
-    'uncorr_wires': ()
-}
+    'uncorr_wires': (),
+    'encoder_config' : {'embed_size' : quantum_dim,
+                        'encoder_type' : 'Amplitude',
+                        'wires' : range(4),
+                        'device' : 'default.qubit',
+                        'pad_val' : 0,
+                        'n_layers' : 2,
+                        'out' : False
+                        }
+    }
 
 # Factory to pass the already instantiated sentiment model to the combined model
 def sentiment_factory(config):
