@@ -231,85 +231,44 @@ class News_Dataset(Abstract_Fin_Dataset):
     def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
         return pd.read_csv(self.unified_file_nm, skip_rows=idx[0], nrows=len(idx)).iloc[[idx], :].to_list()
 
-class Abstract_Sentiment_Model(nn.Module, ABC):
+class Sentiment_Model(nn.Module, ABC):
 
     def __init__(self,
-                 model_name: str,
-                 num_labels: int,
-                 *args, **kwargs) -> None:
+                 model_name: str | None = None,
+                 num_labels: int | None = None,
+                 device: str = 'cpu',
+                 cfg: dict | None = None) -> None:
 
         super().__init__()
 
-        self.model_name = model_name
-        self.transformer = AutoModelForSequenceClassification.from_pretrained(
-            model_name,
-            num_labels=num_labels
+        if isinstance(cfg, dict):
+            self.__dict__.update(cfg)
+        else:
+            self.model_name = model_name
+            self.num_labels = num_labels
+            self.device = device
+       
+        self.mdl = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
+            num_labels=self.num_labels,
+            output_hidden_states = True
         )
        
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
 
-    #no shit Sherlock
-    @abstractmethod
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        ...
-
-class Russian_Sentiment_Model(Abstract_Sentiment_Model):
-    
-    def __init__(self,
-                 model_name: str = "blanchefort/rubert-base-cased-sentiment",
-                 num_labels: int = 3
-                 ) -> None:
-        '''
-        Inputs:
-            model_name: str - name of the model to load
-            num_labels: int - number of labels to expect from the model, default is 3,
-                which corresponds to positive-neutral-negative
-
-        '''
-
-        super().__init__(model_name, num_labels)
+    #TODO: add desc for torch.Tensor
+    def forward(self,
+                text_inputs: torch.Tensor) -> torch.Tensor:
         
-        def forward(self,
-                    input_ids: Iterable[int],
-                    attention_mask: torch.Tensor,
-                    labels=None
-                    ) -> torch.Tensor:
-        
-            '''
-            Forward pass. If labels are provided, returns loss and logits.
-            Otherwise returns only logits.
-            '''
+        self.tokenized_inputs = self.tokenizer(
+                text_inputs, 
+                return_tensors="pt", 
+                truncation=True, 
+                padding=True
+            ).to(self.device)
 
-            outputs = self.transformer(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-
-            if labels is not None:
-                return outputs.loss, outputs.logits
-            else:
-                return outputs.logits
-
-    def predict(self, texts: Iterable[str], device: str = 'cpu') -> torch.Tensor:
-        '''
-        Run inference on a list of texts.
-        Returns predicted class indices and probabilities.
-        '''
-
-        self.eval()
-        with torch.no_grad():
-            encodings = self.tokenizer(
-                texts,
-                truncation=True,
-                padding=True,
-                max_length=128,
-                return_tensors='pt'
-            ).to(device)
-            logits = self.forward(encodings['input_ids'], encodings['attention_mask'])
-            probs = torch.softmax(logits, dim=-1)
-            preds = torch.argmax(probs, dim=-1)
-        return preds, probs
+        outs = self.mdl(**self.tokenized_inputs)
+        return outs
 
 class Quantum_Encoder(nn.Module):
 
@@ -377,7 +336,7 @@ class Quantum_Encoder(nn.Module):
  
 
     def _init_circuit(self,
-                     weights: Annotated[torch.Tensor, 'n_layers', 'custom_val'] | str | None = None
+                     weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] | str | None = None
                      ) -> Callable:
         ''' 
         
@@ -391,12 +350,12 @@ class Quantum_Encoder(nn.Module):
         
         '''
 
-        pad_features = lambda features, wires, pad_val: list(features) + [pad_val]*(len(wires) - len(features))
+        pad_features: Callable[[Iterable, Iterable, int | float], list] = lambda features, wires, pad_val: list(features) + [pad_val]*(len(wires) - len(features))
     
 
         def cond_decorator(condition:bool,
                        decorator: Callable[[Callable], Callable]
-                       ) -> Callable:
+                       ) -> Callable[[Any], Any]:
             '''
             Made to call the qml.qnode decorator conditionally
             '''
@@ -455,7 +414,7 @@ class Quantum_Encoder(nn.Module):
      
                 @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
                 def circuit(features : Sequence,
-                            weights: Annotated[torch.Tensor, 'n_layers', Literal['1', '3', '2*n_qubits']] |\
+                            weights: Annotated[torch.Tensor, ('n_layers', Literal['1', '3', '2*n_qubits'])] |\
                                         None = weights, 
                             **kwargs
                             ) -> torch.Tensor:
@@ -599,7 +558,7 @@ class PatchTST_Quantum_Sentiment(nn.Module):
 
         #Sentiment model initialization
         self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #projection, TODO: change to generalize the integration point
-        self.sentiment_model = sentiment_model(sentiment_config) #init the model with config
+        self.sentiment_model = sentiment_model(cfg=sentiment_config) #init the model with config
         
         #Quantum model initialization
         self.quantum_model = quantum_model(cfg=quantum_model_config)
@@ -642,14 +601,15 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
 
     def forward(self,
-                time_series_inputs: Annotated[torch.Tensor, 'batch_size', 'n_time_steps', 'time_series_dim'],
-                news_inputs: Annotated[torch.Tensor, 'batch_size', 'm_news_articles', 'text_len']
+                time_series_inputs: Annotated[torch.Tensor, ('batch_size', 'n_time_steps', 'time_series_dim')],
+                news_inputs: Annotated[torch.Tensor, ('batch_size', 'm_news_articles', 'text_len')]
                 ) -> torch.Tensor:
         
         batch_size = time_series_inputs.shape[0]
 
-        news_embeds = self.sentiment_model(news_inputs).last_hidden_state #(batch, n_samples, text_length, embed_size)
-        news_embeds_agg = news_embeds.mean(dim=(1,2)) #(batch, embed_size)
+        news_embeds = self.sentiment_model.forward(news_inputs).hidden_states[-1] #(batch, n_samples, text_length, embed_size)
+        news_embeds_agg = news_embeds.mean(dim=1) #(batch, embed_size)
+        print(news_embeds_agg.shape)
         news_embeds_proj = self.sentiment_proj(news_embeds_agg) #(batch, d_model)
         print(f'News_embeds: {news_embeds_proj.shape}')
 

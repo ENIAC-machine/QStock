@@ -9,42 +9,10 @@ from models import (
     PatchTST_Quantum_Sentiment,
     Quantum_Kernel,
     Quantum_Encoder,
-    Russian_Sentiment_Model,
+    Sentiment_Model
 )
+
 from transformers import PatchTSTConfig, PatchTSTForPrediction
-
-# ---------- 1. Wrapper for Russian_Sentiment_Model to provide last_hidden_state ----------
-class RussianSentimentWithHidden(Russian_Sentiment_Model):
-    """Extends Russian_Sentiment_Model to return an object with .last_hidden_state.
-    Input shape: (batch, num_articles, seq_len) – token IDs.
-    Output: object with .last_hidden_state of shape (batch, num_articles, seq_len, hidden_dim).
-    """
-
-    def __init__(self, model_name, num_labels):
-        super().__init__()
-
-
-    def forward(self, input_ids):
-        batch_size, num_articles, seq_len = input_ids.shape
-        input_ids_flat = input_ids.view(batch_size * num_articles, seq_len)
-        attention_mask = torch.ones_like(input_ids_flat)
-
-        # Call transformer directly to get hidden states
-        outputs = self.transformer(
-            input_ids=input_ids_flat,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )
-        last_hidden = outputs.hidden_states[-1]          # (batch*num_articles, seq_len, hidden_dim)
-        hidden_dim = last_hidden.shape[-1]
-        last_hidden = last_hidden.view(batch_size, num_articles, seq_len, hidden_dim)
-
-        class Output:
-            def __init__(self, last_hidden_state):
-                self.last_hidden_state = last_hidden_state
-        return Output(last_hidden)
-
 
 # ---------- 2. Model parameters ----------
 batch_size = 4
@@ -65,14 +33,13 @@ time_series_config = PatchTSTConfig(
     output_hidden_states=True
 )
 
-# Sentiment model
-sentiment_model = RussianSentimentWithHidden(
-    model_name="blanchefort/rubert-base-cased-sentiment",
-    num_labels=3
-)
+sentiment_embed_dim = 768 
+sentiment_config = {
+        'model_name' : "blanchefort/rubert-base-cased-sentiment".strip(),
+        'num_labels' : 3,
+        'device' : 'cpu'
+        }
 
-#actual_hidden_dim = sentiment_model.transformer.config.hidden_size
-sentiment_embed_dim = 768 #actual_hidden_dim
 
 # Quantum model parameters
 quantum_dim = 15
@@ -99,16 +66,12 @@ quantum_model_config = {
                         }
     }
 
-# Factory to pass the already instantiated sentiment model to the combined model
-def sentiment_factory(config):
-    return sentiment_model
-
 # ---------- 3. Instantiate the combined model ----------
 combined_model = PatchTST_Quantum_Sentiment(
     time_series_model=PatchTSTForPrediction,
     time_series_config=time_series_config,
-    sentiment_model=sentiment_factory,
-    sentiment_config={},
+    sentiment_model=Sentiment_Model,
+    sentiment_config=sentiment_config,
     sentiment_embed_dim=sentiment_embed_dim,
     quantum_model=Quantum_Kernel,
     quantum_model_config=quantum_model_config,
@@ -129,7 +92,7 @@ time_series_inputs = torch.randn(batch_size, seq_len, num_features)
 num_articles = 3
 seq_len_text = 128
 vocab_size = 30522
-news_inputs = torch.randint(0, vocab_size, (batch_size, num_articles, seq_len_text))
+news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
 
 # ---------- 5. Forward pass ----------
 output = combined_model(time_series_inputs, news_inputs)
