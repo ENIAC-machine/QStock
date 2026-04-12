@@ -44,7 +44,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data'),
                  batch_size: int = 32,
-                 unified_file_nm: str = 'all_data.csv',
+                 unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
                  delete_old: bool = True,
                  ) -> None:
@@ -54,7 +54,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_elements = 0
-        self.unified_file_nm = unified_file_nm
+        self.unified_filenm = unified_filenm
         self.delete_old = delete_old
         
         if not load_from_file:
@@ -77,18 +77,13 @@ class Abstract_Fin_Dataset(Dataset, ABC):
     def __len__(self) -> int:
         return self.num_elements
 
-    def __iter__(self) -> list[int]:
-        for idx in range(0, self.num_elements, self.batch_size):
-            yield list(range(idx, min(idx+self.batch_size, self.num_elements)))
-
-
 class News_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
                  data_dir: str | Path = os.path.join('.'),
                  batch_size: int = 32,
                  slice_size: int = 10_000,
-                 unified_file_nm: str = 'all_data.csv',
+                 unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
                  delete_old: bool = True,
                  **kwargs
@@ -130,6 +125,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                                leave=False,
                                disable=not verbose,
                                unit=' chunks'):
+                    self.num_elements += df.shape[0]
                     yield df
 
 
@@ -172,7 +168,7 @@ class News_Dataset(Abstract_Fin_Dataset):
             self.data_dir:str | Path = DATA_DIR - inputs in the format (function_to_process_file, file_names)
             self.slice_size: int = 10_000 - size of a chunk DataFrame to load from each archive
             self.delete_old: bool = True - flag to delete the old file
-            self.unified_file_nm: str = 'all_data.csv' - name of the new unified file
+            self.unified_filenm: str = 'all_data.csv' - name of the new unified file
             verbose: bool = True - verbosity flag
 
         Outputs:
@@ -180,7 +176,7 @@ class News_Dataset(Abstract_Fin_Dataset):
 
         '''
 
-        path_save = os.path.join(self.data_dir, self.unified_file_nm)
+        path_save = os.path.join(self.data_dir, self.unified_filenm)
 
         if os.path.exists(path_save) and self.delete_old:
             if verbose:
@@ -227,7 +223,7 @@ class News_Dataset(Abstract_Fin_Dataset):
 
 
     def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
-        return pd.read_csv(self.unified_file_nm,
+        return pd.read_csv(self.unified_filenm,
                            skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
                            nrows=len(idx) if isinstance(idx, Iterable) else 1
                            ).iloc[[idx], :].to_list()
@@ -238,7 +234,7 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data', 'stock_data'),
                  batch_size: int = 32,
-                 unified_file_nm: str = 'stock_data.csv',
+                 unified_filenm: str = 'stock_data.csv',
                  load_from_file: bool = True,
                  delete_old: bool = True,
                  ) -> None:
@@ -273,7 +269,7 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         return None
 
     def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
-        return pd.read_csv(self.unified_file_nm,
+        return pd.read_csv(self.unified_filenm,
                            skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
                            nrows=len(idx) if isinstance(idx, Iterable) else 1
                            ).iloc[[idx], :].to_list()
