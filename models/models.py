@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Sequence, Annotated
 from abc import abstractmethod, ABC
 
-DATA_DIR = os.path.join('..', 'data')
+NEWS_DATA_DIR = os.path.join('..', 'data', 'news_data')
 
 #global variable to map preprocessing functions to the files
 func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
@@ -35,14 +35,14 @@ func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
                                    'news-articles-2015-part1.tar.bz2',
                                    'news-articles-2015-part2.tar.bz2'],
                 load_buriy_webhose : ['webhose-2016.tar.bz2'],
-                pd.read_csv : [file for file in os.listdir(DATA_DIR) if file.endswith('.csv')]
+                pd.read_csv : [file for file in os.listdir(NEWS_DATA_DIR) if file.endswith('.csv')]
                 }
 
 
 class Abstract_Fin_Dataset(Dataset, ABC):
 
     def __init__(self,
-                 data_dir: str | Path = os.path.join('..', 'data'),
+                 data_dir: str | Path,
                  batch_size: int = 32,
                  unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
@@ -54,11 +54,18 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_elements = 0
-        self.unified_filenm = unified_filenm
+        self.unified_filenm = os.path.join(data_dir, unified_filenm)
         self.delete_old = delete_old
         
         if not load_from_file:
             self.load()
+
+    @staticmethod
+    def get_init_args(local_vars: dict) -> dict:
+        kwargs = local_vars.copy()
+        kwargs.pop('self', None)
+        kwargs.pop('__class__', None)
+        return kwargs
 
     @abstractmethod
     def load(self, *args, **kwargs) -> None:
@@ -86,18 +93,19 @@ class Abstract_Fin_Dataset(Dataset, ABC):
 class News_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
-                 data_dir: str | Path = os.path.join('.'),
+                 data_dir: str | Path = os.path.join('..', 'data', 'news_data'),
                  batch_size: int = 32,
                  slice_size: int = 10_000,
                  unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
-                 delete_old: bool = True,
-                 **kwargs
+                 delete_old: bool = True
                  ) -> None:
 
         self.slice_size = slice_size
-        
-        super().__init__()
+        local_vars = locals()
+        local_vars.pop('slice_size')
+
+        super().__init__(**self.get_init_args(local_vars))
 
     def _prepare_data(self,
                       data_path: str | Path,
@@ -171,7 +179,7 @@ class News_Dataset(Abstract_Fin_Dataset):
         Opens archives and saves their contents in a single file
 
         Inputs:
-            self.data_dir:str | Path = DATA_DIR - inputs in the format (function_to_process_file, file_names)
+            self.data_dir:str | Path = NEWS_DATA_DIR - inputs in the format (function_to_process_file, file_names)
             self.slice_size: int = 10_000 - size of a chunk DataFrame to load from each archive
             self.delete_old: bool = True - flag to delete the old file
             self.unified_filenm: str = 'all_data.csv' - name of the new unified file
@@ -236,9 +244,9 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
                  delete_old: bool = True,
                  ) -> None:
 
-        super().__init__()
+        super().__init__(**self.get_init_args(locals()))
         
-        self.current_stock = pd.read_csv(self.unified_filenm, nrows=1)['TICKER'].value
+        #self.current_stock = pd.read_csv(self.unified_filenm, nrows=1)['TICKER'].values
 
     def load(self) -> None:
         tickers= list(set(trading_listing(status='traded')['SECID'].to_list()))
@@ -580,10 +588,12 @@ class PatchTST_Quantum_Sentiment(nn.Module):
                  quantum_stride: int,
                  quantum_depth: int, #depth of the circuit in operations
                  dim_post_quantum: int,
-                 max_quantum_register_size: int = 5 #max register size in qubits
-                 ) -> None:
+                 max_quantum_register_size: int = 5, #max register size in qubits
+                 batch_size: int = 32) -> None:
 
         super().__init__()
+
+        self.batch_size = batch_size
 
         #Time series model initialization
         self.time_series_model = time_series_model(time_series_config) #init model with config
@@ -639,8 +649,6 @@ class PatchTST_Quantum_Sentiment(nn.Module):
                 news_inputs: Annotated[torch.Tensor, ('batch_size', 'm_news_articles', 'text_len')]
                 ) -> torch.Tensor:
         
-        batch_size = time_series_inputs.shape[0]
-
         news_embeds = self.sentiment_model.forward(news_inputs).hidden_states[-1] #(batch, n_samples, text_length, embed_size)
         news_embeds_agg = news_embeds.mean(dim=1) #(batch, embed_size)
         print(news_embeds_agg.shape)
@@ -654,7 +662,7 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         combined = torch.cat([ts_out_agg, news_embeds_proj], dim=1) #(batch, 2*d_model)
 
         if combined.shape[1] < self.quantum_dim:
-            pad = torch.zeros(batch_size,
+            pad = torch.zeros(self.batch_size,
                               self.quantum_dim - combined.shape[1],
                               device=combined.device
                               )
@@ -663,7 +671,10 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         
         q_outs = [] #quantum_registers' outputs
         for idr, register in enumerate(range(0, self.num_registers, self.quantum_stride)):
-            to_encode = combined[:, idr: idr+(1 << self.max_quantum_register_size)]
+            to_encode = combined[:, idr : min(combined.shape[1],
+                                              idr+(1 << self.max_quantum_register_size)
+                                                )
+                                 ]
             to_encode = F.normalize(to_encode, p=2, dim=1)*2*np.pi #normalize to [0, 2pi] to encode
             q_outs.append(self.quantum_model.forward(to_encode))
 
@@ -729,7 +740,7 @@ if __name__ == '__main__':
                             'device' : 'default.qubit',
                             'pad_val' : 0,
                             'n_layers' : 2,
-                            'out' : False
+                            'out' : True
                             }
         }
 
@@ -756,11 +767,15 @@ if __name__ == '__main__':
     # ---------- Prepare data ----------
 
     path_news_data = os.path.join('..', 'data', 'news_data')
-    news_data = News_Dataset(path_data)
+    news_data = News_Dataset(path_news_data,
+                             load_from_file=True,
+                             delete_old=False)
 
 
     path_time_series_data = os.path.join('..', 'data', 'stock_data')
-    time_series_inputs = torch.randn(batch_size, seq_len, num_features)
+    time_series_inputs = Time_Series_Dataset(path_time_series_data,
+                                             load_from_file=True,
+                                             delete_old=True)
 
     # News input – dummy token IDs (batch, num_articles, seq_len_text)
     news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
