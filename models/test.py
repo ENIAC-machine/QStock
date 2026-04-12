@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-# Assume models.py is in the same directory
 sys.path.append('.')
 from models import (
     PatchTST_Quantum_Sentiment,
@@ -14,7 +13,7 @@ from models import (
 
 from transformers import PatchTSTConfig, PatchTSTForPrediction
 
-# ---------- 2. Model parameters ----------
+# ----------  Model parameters ----------
 batch_size = 4
 seq_len = 10               # time series sequence length
 num_features = 5
@@ -33,6 +32,8 @@ time_series_config = PatchTSTConfig(
     output_hidden_states=True
 )
 
+
+#Sentiment model shenanigans
 sentiment_embed_dim = 768 
 sentiment_config = {
         'model_name' : "blanchefort/rubert-base-cased-sentiment".strip(),
@@ -66,7 +67,7 @@ quantum_model_config = {
                         }
     }
 
-# ---------- 3. Instantiate the combined model ----------
+# ---------- Instantiate the combined model ----------
 combined_model = PatchTST_Quantum_Sentiment(
     time_series_model=PatchTSTForPrediction,
     time_series_config=time_series_config,
@@ -84,7 +85,7 @@ combined_model = PatchTST_Quantum_Sentiment(
 
 print("Combined model instantiated successfully.")
 
-# ---------- 4. Prepare dummy input ----------
+# ---------- Prepare dummy input ----------
 # Time series input (batch, seq_len, num_features)
 time_series_inputs = torch.randn(batch_size, seq_len, num_features)
 
@@ -94,11 +95,11 @@ seq_len_text = 128
 vocab_size = 30522
 news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
 
-# ---------- 5. Forward pass ----------
+# ---------- Forward pass ----------
 output = combined_model(time_series_inputs, news_inputs)
 print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
 
-# ---------- 6. Simple backward pass ----------
+# ---------- Simple backward pass ----------
 target = torch.randn(batch_size, prediction_length)
 loss = nn.MSELoss()(output, target)
 loss.backward()

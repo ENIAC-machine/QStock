@@ -9,7 +9,7 @@ import pennylane as qml
 
 from itertools import islice
 from corus import load_lenta, load_lenta2, load_mokoron, load_buriy_news, load_buriy_webhose
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, ConcatDataset, Dataset
 
 from transformers import (
         AutoTokenizer, AutoModelForSequenceClassification, 
@@ -18,6 +18,8 @@ from transformers import (
 
 from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
+
+from moex_api.history import history, trading_listing
 
 from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Sequence, Annotated
@@ -41,7 +43,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
 
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data'),
-                 batch_size: int | None = None,
+                 batch_size: int = 32,
                  unified_file_nm: str = 'all_data.csv',
                  load_from_file: bool = False,
                  delete_old: bool = True,
@@ -51,7 +53,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
 
         self.data_dir = data_dir
         self.batch_size = batch_size
-        self.num_elements = None
+        self.num_elements = 0
         self.unified_file_nm = unified_file_nm
         self.delete_old = delete_old
         
@@ -84,6 +86,7 @@ class News_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
                  data_dir: str | Path = os.path.join('.'),
+                 batch_size: int = 32,
                  slice_size: int = 10_000,
                  unified_file_nm: str = 'all_data.csv',
                  load_from_file: bool = False,
@@ -91,14 +94,9 @@ class News_Dataset(Abstract_Fin_Dataset):
                  **kwargs
                  ) -> None:
 
-        super().__init__()
-
         self.slice_size = slice_size
-        self.unified_file_nm = unified_file_nm
-        self.delete_old = delete_old
-
-        self.load()
-
+        
+        super().__init__()
 
     def _prepare_data(self,
                       data_path: str | Path,
@@ -214,7 +212,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                                   unit=" files",
                                   disable=not verbose):
 
-                for df in self._prepare_data(data_path, load_func, self.slice_size, verbose):
+                for df in self._prepare_data(data_path, load_func, verbose):
 
                     if 'date' not in df.columns:
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
@@ -229,7 +227,56 @@ class News_Dataset(Abstract_Fin_Dataset):
 
 
     def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
-        return pd.read_csv(self.unified_file_nm, skip_rows=idx[0], nrows=len(idx)).iloc[[idx], :].to_list()
+        return pd.read_csv(self.unified_file_nm,
+                           skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
+                           nrows=len(idx) if isinstance(idx, Iterable) else 1
+                           ).iloc[[idx], :].to_list()
+
+
+class Time_Series_Dataset(Abstract_Fin_Dataset):
+
+    def __init__(self,
+                 data_dir: str | Path = os.path.join('..', 'data', 'stock_data'),
+                 batch_size: int = 32,
+                 unified_file_nm: str = 'stock_data.csv',
+                 load_from_file: bool = True,
+                 delete_old: bool = True,
+                 ) -> None:
+
+        super().__init__()
+        
+        self.current_stock = pd.read_csv(self.unified_filenm, nrows=1)['TICKER'].value
+
+    def load(self) -> None:
+        tickers= list(set(trading_listing(status='traded')['SECID'].to_list()))
+
+        df = history(list(tickers),
+             st='2000-01-01',
+             end='2026-01-01',
+             max_retries=20,
+             retry_pause=4,
+             verbose=True)
+
+        def func(sub_df):
+            sub_df = sub_df.T.droplevel(axis=1, level=0)
+            sub_df = sub_df[['TRADEDATE', 'OPEN', 'CLOSE', 'HIGH', 'LOW']]
+            sub_df.dropna(axis=0, inplace=True)
+            return sub_df
+        
+        df = df.T.groupby(level=0).apply(func).reset_index().\
+                rename(columns={'DataFrame' : 'TICKER'}).\
+                set_index('TRADEDATE').drop(columns='level_1').\
+                sort_values('TRADEDATE')
+                
+        self.num_elements = len(df)
+        df.to_csv(self.unified_filenm)
+        return None
+
+    def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
+        return pd.read_csv(self.unified_file_nm,
+                           skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
+                           nrows=len(idx) if isinstance(idx, Iterable) else 1
+                           ).iloc[[idx], :].to_list()
 
 class Sentiment_Model(nn.Module, ABC):
 
@@ -642,3 +689,103 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         out = self.out_proj(post_q_outs)
         print(f'out: {out.shape}')
         return out
+
+
+if __name__ == '__main__':
+    # ----------  Model parameters ----------
+    batch_size = 4
+    seq_len = 10               # time series sequence length
+    num_features = 5
+    prediction_length = 2
+    d_model = 8                # hidden dimension for PatchTST
+
+    # Time series config (PatchTST)
+    time_series_config = PatchTSTConfig(
+        context_length=seq_len,
+        prediction_length=prediction_length,
+        d_model=d_model,
+        num_input_channels=num_features,
+        patch_length=5,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        output_hidden_states=True
+    )
+
+
+    #Sentiment model shenanigans
+    sentiment_embed_dim = 768 
+    sentiment_config = {
+            'model_name' : "blanchefort/rubert-base-cased-sentiment".strip(),
+            'num_labels' : 3,
+            'device' : 'cpu'
+            }
+
+
+    # Quantum model parameters
+    quantum_dim = 15
+    quantum_stride = 2
+    quantum_depth = 1
+    dim_post_quantum = d_model
+    max_quantum_register_size = 5
+
+    quantum_model_config = {
+        'layer_type' : 'StronglyEntanglingLayers',
+        'n_layers' : 2,
+        'wires': range(4),
+        'layer_config': None,
+        'encoder': Quantum_Encoder,
+        'device': 'default.qubit',
+        'uncorr_wires': (),
+        'encoder_config' : {'embed_size' : quantum_dim,
+                            'encoder_type' : 'Amplitude',
+                            'wires' : range(4),
+                            'device' : 'default.qubit',
+                            'pad_val' : 0,
+                            'n_layers' : 2,
+                            'out' : False
+                            }
+        }
+
+    
+
+    # ---------- Instantiate the combined model ----------
+    combined_model = PatchTST_Quantum_Sentiment(
+        time_series_model=PatchTSTForPrediction,
+        time_series_config=time_series_config,
+        sentiment_model=Sentiment_Model,
+        sentiment_config=sentiment_config,
+        sentiment_embed_dim=sentiment_embed_dim,
+        quantum_model=Quantum_Kernel,
+        quantum_model_config=quantum_model_config,
+        quantum_dim=quantum_dim,
+        quantum_stride=quantum_stride,
+        quantum_depth=quantum_depth,
+        dim_post_quantum=dim_post_quantum,
+        max_quantum_register_size=max_quantum_register_size
+    )
+
+    print("Combined model instantiated successfully.")
+
+    # ---------- Prepare data ----------
+
+    path_news_data = os.path.join('..', 'data', 'news_data')
+    news_data = News_Dataset(path_data)
+
+
+    path_time_series_data = os.path.join('..', 'data', 'stock_data')
+    time_series_inputs = torch.randn(batch_size, seq_len, num_features)
+
+    # News input – dummy token IDs (batch, num_articles, seq_len_text)
+    news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
+
+    # ---------- Forward pass ----------
+    output = combined_model(time_series_inputs, news_inputs)
+    print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
+
+    # ---------- Simple backward pass ----------
+    target = torch.randn(batch_size, prediction_length)
+    loss = nn.MSELoss()(output, target)
+    loss.backward()
+    print("Backward pass completed. Gradients exist:", any(
+        p.grad is not None for p in combined_model.parameters()
+    ))
