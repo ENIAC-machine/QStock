@@ -77,6 +77,12 @@ class Abstract_Fin_Dataset(Dataset, ABC):
     def __len__(self) -> int:
         return self.num_elements
 
+    def __getitem__(self, idx: int) -> list[Any]:
+        return pd.read_csv(self.unified_filenm,
+                           skip_rows= idx,
+                           nrows=1
+                           ).iloc[idx, :].to_list()
+
 class News_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
@@ -184,9 +190,7 @@ class News_Dataset(Abstract_Fin_Dataset):
             os.remove(path_save)
         
 
-        header = True
-        df_tmp = pd.DataFrame(columns=['date', 'text']).to_csv(path_save, header=header)
-        header = False
+        pd.DataFrame(columns=['date', 'text']).to_csv(path_save, header=True)
 
         for load_func, data_paths in tqdm(func_to_data.items(),
                                           desc='Loading data',
@@ -214,19 +218,12 @@ class News_Dataset(Abstract_Fin_Dataset):
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
                         
                     df.to_csv(path_save,
-                              header=header,
+                              header=False,
                               mode='a',
                               columns=['date', 'text']
                               )
 
         return None 
-
-
-    def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
-        return pd.read_csv(self.unified_filenm,
-                           skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
-                           nrows=len(idx) if isinstance(idx, Iterable) else 1
-                           ).iloc[[idx], :].to_list()
 
 
 class Time_Series_Dataset(Abstract_Fin_Dataset):
@@ -268,12 +265,6 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         df.to_csv(self.unified_filenm)
         return None
 
-    def __getitem__(self, idx: int | Iterable[int]) -> list[Any]:
-        return pd.read_csv(self.unified_filenm,
-                           skip_rows=idx[0] if isinstance(idx, Iterable) else idx,
-                           nrows=len(idx) if isinstance(idx, Iterable) else 1
-                           ).iloc[[idx], :].to_list()
-
 class Sentiment_Model(nn.Module, ABC):
 
     def __init__(self,
@@ -303,14 +294,14 @@ class Sentiment_Model(nn.Module, ABC):
     def forward(self,
                 text_inputs: torch.Tensor) -> torch.Tensor:
         
-        self.tokenized_inputs = self.tokenizer(
+        tokenized_inputs = self.tokenizer(
                 text_inputs, 
                 return_tensors="pt", 
                 truncation=True, 
                 padding=True
             ).to(self.device)
 
-        outs = self.mdl(**self.tokenized_inputs)
+        outs = self.mdl(**tokenized_inputs)
         return outs
 
 class Quantum_Encoder(nn.Module):
@@ -414,7 +405,7 @@ class Quantum_Encoder(nn.Module):
 
             case 'Amplitude':
                 
-                self.embed_size = 1 << len(bin(self.embed_size).split('b')[-1])
+                self.embed_size = 1 << len(bin(len(self.wires)).split('b')[-1])
 
                 assert bin(self.embed_size).split('b')[-1].count('1') == 1, "self.embed_size is not a power of 2"
 
