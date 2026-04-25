@@ -1,4 +1,8 @@
 import os
+os.environ["USE_TF"] = "NO"
+os.environ["USE_TORCH"] = "YES"
+
+
 import sys
 import numpy as np
 import pandas as pd
@@ -111,7 +115,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                       data_path: str | Path,
                       load_func: Callable,
                       verbose: bool = True
-                      ) -> Generator[pd.DataFrame | None]:
+                      ):# -> Generator[pd.DataFrame | None]:
 
         '''
         Function to prepare data of a single file (archive of csv) into a pd.DataFrame object
@@ -528,8 +532,7 @@ class Quantum_Kernel(nn.Module):
                                                                 )
     def _init_circuit(self,
                       kernel_weights: Annotated[torch.Tensor, ('n_layers', 'n_wires', 3)] |\
-                                        Annotated[
-                                            Iterable[
+                                        Annotated[[
                                                 Annotated[torch.Tensor,
                                                           'n_wires'],
                                                 Annotated[torch.Tensor,
@@ -574,14 +577,11 @@ class Quantum_Kernel(nn.Module):
 
         return self.circuit(features)
 
-class PatchTST_Quantum_Sentiment(nn.Module):
+class Time_Series_Quantum_Sentiment(nn.Module):
 
     def __init__(self,
                  time_series_model: nn.Module,
                  time_series_config: dict,
-                 sentiment_model: nn.Module,
-                 sentiment_config: dict,
-                 sentiment_embed_dim: int,
                  quantum_model: nn.Module,
                  quantum_model_config: dict,
                  quantum_dim: int,
@@ -594,16 +594,17 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         super().__init__()
 
         self.batch_size = batch_size
+        
+        if hasattr(time_series_config, 'hidden_dim'):
+            self.hidden_dim = time_series_config['hidden_dim']
+        else:
+            self.hidden_dim = -1
 
         #Time series model initialization
         self.time_series_model = time_series_model(time_series_config) #init model with config
         self.time_series_proj_dim = time_series_config.d_model #define the projection dim ,TODO: change to generalize the integration point
         
 
-        #Sentiment model initialization
-        self.sentiment_proj = nn.Linear(sentiment_embed_dim, self.time_series_proj_dim) #projection, TODO: change to generalize the integration point
-        self.sentiment_model = sentiment_model(cfg=sentiment_config) #init the model with config
-        
         #Quantum model initialization
         self.quantum_model = quantum_model(cfg=quantum_model_config)
         self.q_encoder_weights = nn.Parameter(
@@ -644,24 +645,39 @@ class PatchTST_Quantum_Sentiment(nn.Module):
 
         self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
 
+
     def forward(self,
-                time_series_inputs: Annotated[torch.Tensor, ('batch_size', 'n_time_steps', 'time_series_dim')],
-                news_inputs: Annotated[torch.Tensor, ('batch_size', 'm_news_articles', 'text_len')]
+                time_series_inputs: Annotated[torch.Tensor,
+                                              ('batch_size',
+                                               'n_time_steps',
+                                               'time_series_dim'
+                                               )
+                                              ],
+                sentiment: Annotated[torch.Tensor,
+                                       ('batch_size',
+                                        1
+                                        )
+                                       ]
                 ) -> torch.Tensor:
+        '''
+        time_series_inputs: Annotated[torch.Tensor,
+                                              ('batch_size',
+                                               'n_time_steps',
+                                               'time_series_dim'
+                                               )
+                                              ] - time series tensor
+        sentiment: Annotated[torch.Tensor,
+                                       ('batch_size',
+                                        1
+                                        )
+                                       ] - sentiment values
+        '''
         
-        news_embeds = self.sentiment_model.forward(news_inputs).hidden_states[-1] #(batch, n_samples, text_length, embed_size)
-        news_embeds_agg = news_embeds.mean(dim=1) #(batch, embed_size)
-        print(news_embeds_agg.shape)
-        news_embeds_proj = self.sentiment_proj(news_embeds_agg) #(batch, d_model)
-        print(f'News_embeds: {news_embeds_proj.shape}')
-
-        ts_out = self.time_series_model(time_series_inputs).hidden_states[-1] #(batch, n_patches, embed_size, d_model)
+        ts_out = self.time_series_model(time_series_inputs).hidden_states[self.hidden_dim] #(batch, n_patches, embed_size, d_model)
         ts_out_agg = ts_out.mean(dim=(1,2))
-        print(f'Time-series embeds: {ts_out_agg.shape}')
-
-        combined = torch.cat([ts_out_agg, news_embeds_proj], dim=1) #(batch, 2*d_model)
-
-        if combined.shape[1] < self.quantum_dim:
+        #print(f'Time-series embeds: {ts_out_agg.shape}')
+        
+        if ts_out_agg.shape[1] < self.quantum_dim:
             pad = torch.zeros(self.batch_size,
                               self.quantum_dim - combined.shape[1],
                               device=combined.device
@@ -670,13 +686,23 @@ class PatchTST_Quantum_Sentiment(nn.Module):
             combined = torch.cat([combined, pad], dim=1)
         
         q_outs = [] #quantum_registers' outputs
-        for idr, register in enumerate(range(0, self.num_registers, self.quantum_stride)):
-            to_encode = combined[:, idr : min(combined.shape[1],
+        for idr, register in enumerate(range(0,
+                                             self.num_registers,
+                                             self.quantum_stride)
+                                       ):
+            to_encode = combined[:,
+                                 idr : min(combined.shape[1],
                                               idr+(1 << self.max_quantum_register_size)
                                                 )
                                  ]
-            to_encode = F.normalize(to_encode, p=2, dim=1)*2*np.pi #normalize to [0, 2pi] to encode
-            q_outs.append(self.quantum_model.forward(to_encode))
+            magnitudes = to_encode.norm(p=2, dim=1, keepdim=True)
+
+            to_encode = F.normalize(to_encode,
+                                    p=2,
+                                    dim=1
+                                    )*2*np.pi #normalize to [0, 2pi] to encode
+            
+            q_outs.append(self.quantum_model.forward(to_encode)*magnitudes)
 
         q_outs = torch.cat(q_outs, dim=1).float()
         print(f'q_outs: {q_outs.shape}') #(batch, )
@@ -688,6 +714,32 @@ class PatchTST_Quantum_Sentiment(nn.Module):
         print(f'out: {out.shape}')
         return out
 
+
+
+class TS_JOPA(nn.Module):
+
+    def __init__(self,
+                 ts_sentiment_mdl: nn.Module,
+                 text_to_sentiment_mdl: nn.Module 
+                 ) -> None:
+        
+        super().__init__()
+
+        self.ts_snt_mdl = ts_sentiment_mdl
+        self.text_to_snt = text_to_sentiment_mdl
+
+
+    def forward(self,
+                ts_input: torch.Tensor, #(batch_size, lookback, num_features)
+                text_input: torch.Tensor #(batch_size, lookback, arbitrary)
+                ) -> torch.Tensor:
+
+        # (batch_size, 1)
+        sentiment: torch.Tensor = self.text_to_snt(text_input.reshape(batch_size, -1)).mean(1)
+
+        out: torch.Tensor = self.ts_snt_mdl(ts_input, sentiment) 
+        return out
+    
 
 if __name__ == '__main__':
     # ----------  Model parameters ----------
@@ -708,16 +760,6 @@ if __name__ == '__main__':
         num_hidden_layers=1,
         output_hidden_states=True
     )
-
-
-    #Sentiment model shenanigans
-    sentiment_embed_dim = 768 
-    sentiment_config = {
-            'model_name' : "blanchefort/rubert-base-cased-sentiment".strip(),
-            'num_labels' : 3,
-            'device' : 'cpu'
-            }
-
 
     # Quantum model parameters
     quantum_dim = 15
@@ -747,12 +789,9 @@ if __name__ == '__main__':
     
 
     # ---------- Instantiate the combined model ----------
-    combined_model = PatchTST_Quantum_Sentiment(
+    combined_model = Time_Series_Quantum_Sentiment(
         time_series_model=PatchTSTForPrediction,
         time_series_config=time_series_config,
-        sentiment_model=Sentiment_Model,
-        sentiment_config=sentiment_config,
-        sentiment_embed_dim=sentiment_embed_dim,
         quantum_model=Quantum_Kernel,
         quantum_model_config=quantum_model_config,
         quantum_dim=quantum_dim,
@@ -761,6 +800,16 @@ if __name__ == '__main__':
         dim_post_quantum=dim_post_quantum,
         max_quantum_register_size=max_quantum_register_size
     )
+
+    sentiment_cfg = {
+            "model_name": "bert-base-uncased",
+            "num_labels": 3,                  
+            "device": "cpu"
+            }
+
+    sentiment_model = Sentiment_Model(cfg=sentiment_cfg)
+
+    JOPA = TS_JOPA(combined_model, sentiment_model)
 
     print("Combined model instantiated successfully.")
 
@@ -778,7 +827,10 @@ if __name__ == '__main__':
                                              delete_old=True)
 
     # News input – dummy token IDs (batch, num_articles, seq_len_text)
-    news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
+    news_inputs = torch.Tensor(np.array(['this is good',
+                                'this is bad',
+                                'nice',
+                                'really bad']))
 
     # ---------- Forward pass ----------
     output = combined_model(time_series_inputs, news_inputs)
