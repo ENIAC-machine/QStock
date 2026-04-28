@@ -58,7 +58,8 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_elements = 0
-        self.unified_filenm = os.path.join(data_dir, unified_filenm)
+        self.unified_filenm = unified_filenm
+        self.unified_filepath = os.path.join(data_dir, unified_filenm)
         self.delete_old = delete_old
         
         if not load_from_file:
@@ -102,7 +103,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                  slice_size: int = 10_000,
                  unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
-                 delete_old: bool = True
+                 delete_old: bool = True,
                  ) -> None:
 
         self.slice_size = slice_size
@@ -164,8 +165,10 @@ class News_Dataset(Abstract_Fin_Dataset):
                                             if col in ['date', 'text', 'timestamp']
                                    ]
                     
-                        df = pd.DataFrame(data, columns=data[-1].__attributes__)[columns]
+                        df = pd.DataFrame(data,
+                                          columns=data[-1].__attributes__)[columns]
                         yield df 
+                        
                         lines_cnt += df.shape[0]
                         self.num_elements += df.shape[0]
                         progress.update(self.slice_size) 
@@ -186,7 +189,7 @@ class News_Dataset(Abstract_Fin_Dataset):
             self.data_dir:str | Path = NEWS_DATA_DIR - inputs in the format (function_to_process_file, file_names)
             self.slice_size: int = 10_000 - size of a chunk DataFrame to load from each archive
             self.delete_old: bool = True - flag to delete the old file
-            self.unified_filenm: str = 'all_data.csv' - name of the new unified file
+            self.unified_filepath: str = 'all_data.csv' - name of the new unified file
             verbose: bool = True - verbosity flag
 
         Outputs:
@@ -194,19 +197,18 @@ class News_Dataset(Abstract_Fin_Dataset):
 
         '''
 
-        path_save = os.path.join(self.data_dir, self.unified_filenm)
-
-        if os.path.exists(path_save) and self.delete_old:
+        if os.path.exists(self.unified_filepath) and self.delete_old:
             if verbose:
                 print('Found file with the same name in the data directory, deleting...')
-            os.remove(path_save)
+            os.remove(self.unified_filepath)
         
 
-        pd.DataFrame(columns=['date', 'text']).to_csv(path_save, header=True)
+        pd.DataFrame(columns=['date', 'text']).to_csv(self.unified_filepath,
+                                                      header=True)
 
         for load_func, data_paths in tqdm(func_to_data.items(),
                                           desc='Loading data',
-                                          unit=' file batches',
+       unit=' file batches',
                                           colour='green',
                                           disable=not verbose):
 
@@ -215,8 +217,11 @@ class News_Dataset(Abstract_Fin_Dataset):
                                     leave=False,
                                     disable=not verbose):
                 data_paths[idx] = os.path.join(self.data_dir, filenm) #integrate full path with filename
-            
-            data_path = data_paths[0]
+           
+            if len(data_paths):
+                data_path = data_paths[0]
+            else:
+                continue
 
             for data_path in tqdm(data_paths,
                                   desc=f'Loading archive {data_path}',
@@ -224,12 +229,16 @@ class News_Dataset(Abstract_Fin_Dataset):
                                   unit=" files",
                                   disable=not verbose):
 
-                for df in self._prepare_data(data_path, load_func, verbose):
+                for df in self._prepare_data(data_path,
+                                             load_func,
+                                             verbose):
 
                     if 'date' not in df.columns:
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
-                        
-                    df.to_csv(path_save,
+                
+                    df = df.ffill()
+
+                    df.to_csv(self.unified_filepath,
                               header=False,
                               mode='a',
                               columns=['date', 'text']
@@ -237,6 +246,44 @@ class News_Dataset(Abstract_Fin_Dataset):
 
         return None 
 
+    def to_sentiment(self,
+                     new_filepath: str | None = None,
+                     mdl_cfg: dict | Any | None = None,
+                     batch_size: int = 100,
+                     verbose: bool = True
+                     )->None:
+        
+        if new_filepath is None:
+            new_filepath = self.unified_filepath.split('.')[0] + '_sentiment.csv'
+        
+        mdl = Sentiment_Model(cfg=mdl_cfg)
+        mdl.eval()
+
+        reader = pd.read_csv(self.unified_filepath, chunksize=batch_size) 
+        pd.DataFrame(columns=['date', 'sentiment']).to_csv(new_filepath, header=True)
+        
+        with torch.no_grad():
+       
+            for df in tqdm(reader,
+                           desc='Converting text to sentiment',
+                           total=int(np.ceil(self.num_elements / batch_size)),
+                           leave=False,
+                           disable=not verbose,
+                           unit=' batches'):
+                
+                #(batch_size, 1)
+                sentiment_scores = mdl.forward(
+                                df['text'].fillna('nothing').tolist()
+                                )
+
+                df['sentiment'] = sentiment_scores.cpu().numpy()
+                
+                df.to_csv(new_filepath,
+                          header=False,
+                          mode='a',
+                          columns=['date', 'sentiment']
+                          )
+            return None
 
 class Time_Series_Dataset(Abstract_Fin_Dataset):
 
@@ -283,6 +330,7 @@ class Sentiment_Model(nn.Module, ABC):
                  model_name: str | None = None,
                  num_labels: int | None = None,
                  device: str = 'cpu',
+                 score: bool = False,
                  cfg: dict | None = None) -> None:
 
         super().__init__()
@@ -293,14 +341,19 @@ class Sentiment_Model(nn.Module, ABC):
             self.model_name = model_name
             self.num_labels = num_labels
             self.device = device
+            self.score = score
        
         self.mdl = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
             num_labels=self.num_labels,
             output_hidden_states = True
         )
-       
+      
+        self.mdl.to(self.device)
+
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+        return
 
     #TODO: add desc for torch.Tensor
     def forward(self,
@@ -314,7 +367,14 @@ class Sentiment_Model(nn.Module, ABC):
             ).to(self.device)
 
         outs = self.mdl(**tokenized_inputs)
-        return outs
+
+        if self.score:
+            #print(outs.logits.shape)
+            probs = F.softmax(outs.logits, dim=-1)
+            probs = probs[:, 2] - probs[:, 0]
+            return probs
+        else:
+            return outs
 
 class Quantum_Encoder(nn.Module):
 
@@ -577,7 +637,7 @@ class Quantum_Kernel(nn.Module):
 
         return self.circuit(features)
 
-class Time_Series_Quantum_Sentiment(nn.Module):
+class TS_JOPA(nn.Module):
 
     def __init__(self,
                  time_series_model: nn.Module,
@@ -715,32 +775,6 @@ class Time_Series_Quantum_Sentiment(nn.Module):
         return out
 
 
-
-class TS_JOPA(nn.Module):
-
-    def __init__(self,
-                 ts_sentiment_mdl: nn.Module,
-                 text_to_sentiment_mdl: nn.Module 
-                 ) -> None:
-        
-        super().__init__()
-
-        self.ts_snt_mdl = ts_sentiment_mdl
-        self.text_to_snt = text_to_sentiment_mdl
-
-
-    def forward(self,
-                ts_input: torch.Tensor, #(batch_size, lookback, num_features)
-                text_input: torch.Tensor #(batch_size, lookback, arbitrary)
-                ) -> torch.Tensor:
-
-        # (batch_size, 1)
-        sentiment: torch.Tensor = self.text_to_snt(text_input.reshape(batch_size, -1)).mean(1)
-
-        out: torch.Tensor = self.ts_snt_mdl(ts_input, sentiment) 
-        return out
-    
-
 if __name__ == '__main__':
     # ----------  Model parameters ----------
     batch_size = 4
@@ -789,7 +823,7 @@ if __name__ == '__main__':
     
 
     # ---------- Instantiate the combined model ----------
-    combined_model = Time_Series_Quantum_Sentiment(
+    combined_model = TS_JOPA(
         time_series_model=PatchTSTForPrediction,
         time_series_config=time_series_config,
         quantum_model=Quantum_Kernel,
@@ -802,14 +836,15 @@ if __name__ == '__main__':
     )
 
     sentiment_cfg = {
-            "model_name": "bert-base-uncased",
+            "model_name": "ProsusAI/finbert",
             "num_labels": 3,                  
-            "device": "cpu"
+            "device": "cuda" if torch.cuda.is_available() else 'cpu',
+            "score" : True
             }
 
-    sentiment_model = Sentiment_Model(cfg=sentiment_cfg)
+    #sentiment_model = Sentiment_Model(cfg=sentiment_cfg)
 
-    JOPA = TS_JOPA(combined_model, sentiment_model)
+    #JOPA = TS_JOPA(combined_model, sentiment_model)
 
     print("Combined model instantiated successfully.")
 
@@ -817,9 +852,12 @@ if __name__ == '__main__':
 
     path_news_data = os.path.join('..', 'data', 'news_data')
     news_data = News_Dataset(path_news_data,
-                             load_from_file=True,
-                             delete_old=False)
+                             load_from_file=False,
+                             delete_old=True)
 
+    news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
+
+    '''
 
     path_time_series_data = os.path.join('..', 'data', 'stock_data')
     time_series_inputs = Time_Series_Dataset(path_time_series_data,
@@ -843,3 +881,4 @@ if __name__ == '__main__':
     print("Backward pass completed. Gradients exist:", any(
         p.grad is not None for p in combined_model.parameters()
     ))
+    '''
