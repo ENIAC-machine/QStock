@@ -273,7 +273,6 @@ class News_Dataset(Abstract_Fin_Dataset):
                                   disable=not verbose,
                                   initial=checkpoint['data_path']):
 
-<<<<<<< HEAD
                  for df in tqdm(self._prepare_data(data_path = data_path,
                                                   load_func=load_func,
                                                   verbose=verbose),
