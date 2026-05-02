@@ -7,13 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pennylane as qml
 
-from itertools import islice
+from itertools import islice, zip_longest
 from corus import load_lenta, load_lenta2, load_mokoron, load_buriy_news, load_buriy_webhose
 from torch.utils.data import DataLoader, ConcatDataset, Dataset
 
 from transformers import (
         AutoTokenizer, AutoModelForSequenceClassification, 
-        PatchTSTConfig, PatchTSTForPrediction
+        PatchTSTConfig, PatchTSTForPrediction, pipeline
         )
 
 from sklearn.metrics import accuracy_score, classification_report
@@ -24,6 +24,11 @@ from moex_api.history import history, trading_listing
 from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Sequence, Annotated
 from abc import abstractmethod, ABC
+
+from warnings import filterwarnings
+
+filterwarnings('ignore')
+
 
 NEWS_DATA_DIR = os.path.join('..', 'data', 'news_data')
 
@@ -37,6 +42,8 @@ func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
                 load_buriy_webhose : ['webhose-2016.tar.bz2'],
                 pd.read_csv : [file for file in os.listdir(NEWS_DATA_DIR) if file.endswith('.csv')]
                 }
+
+
 
 
 class Abstract_Fin_Dataset(Dataset, ABC):
@@ -54,7 +61,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_elements = 0
-        self.unified_filenm = os.path.join(data_dir, unified_filenm)
+        self.unified_filenm = unified_filenm 
         self.delete_old = delete_old
         
         if not load_from_file:
@@ -108,8 +115,8 @@ class News_Dataset(Abstract_Fin_Dataset):
         super().__init__(**self.get_init_args(local_vars))
 
     def _prepare_data(self,
-                      data_path: str | Path,
                       load_func: Callable,
+                      data_path: str | Path | None = None,
                       verbose: bool = True
                       ) -> Generator[pd.DataFrame | None]:
 
@@ -128,7 +135,9 @@ class News_Dataset(Abstract_Fin_Dataset):
         '''
 
         end = data_path.split('.')[-1]
+        #print(end)
 
+        #print(f'data_path={data_path}')
         match end:
 
             case 'csv':
@@ -160,8 +169,22 @@ class News_Dataset(Abstract_Fin_Dataset):
                                             if col in ['date', 'text', 'timestamp']
                                    ]
                     
-                        df = pd.DataFrame(data, columns=data[-1].__attributes__)[columns]
+                        df = pd.DataFrame(data, columns=data[-1].__attributes__)
+                        if pd.unique(df['date']) == None:
+
+                            #attempt to reconstruct date from url, drop values that can't be converted 
+                            df['date'] = pd.to_datetime(df['url'].apply(lambda x: '/'.join(x.split('news/')[-1].\
+                                                                                             split('/')[:3]
+                                                                                           )
+                                                                        ),
+                                                        errors='coerce'
+                                                        ).dropna(how='any',
+                                                                 axis=0
+                                                                 ).reset_index(drop=True).apply(lambda x:x.date())
+                        df = df[columns]
+                        
                         yield df 
+                        
                         lines_cnt += df.shape[0]
                         self.num_elements += df.shape[0]
                         progress.update(self.slice_size) 
@@ -172,6 +195,7 @@ class News_Dataset(Abstract_Fin_Dataset):
 
 
     def load(self,
+             mdl_nm: str = 'seara/rubert-tiny2-russian-sentiment',
              verbose: bool = True
              ) -> None:
 
@@ -198,40 +222,118 @@ class News_Dataset(Abstract_Fin_Dataset):
             os.remove(path_save)
         
 
-        pd.DataFrame(columns=['date', 'text']).to_csv(path_save, header=True)
+        pd.DataFrame(columns=['date', 'text', 'sentiment']).to_csv(path_save, header=True)
 
-        for load_func, data_paths in tqdm(func_to_data.items(),
+        mapping = {'neutral' : 0, 'positive': 1, 'negative' : -1}
+
+        if os.path.exists('checkpoint.pkl'):
+            with open('checkpoint.pkl', 'rb') as file:
+                checkpoint: dict[str, int] = pickle.load(file)
+        else:
+            checkpoint = {'load_func' : 0,
+                          'data_path' : 0,
+                          'df' : 0,
+                          'dt' : 0
+                          }
+
+        def save_checkpoint() -> None:
+            with open('checkpoint.pkl', 'wb') as file:
+                pickle.dump(checkpoint, file)
+            return None
+
+        for load_func, data_paths in tqdm(func_to_data.items()[checkpoint['load_func']],
                                           desc='Loading data',
                                           unit=' file batches',
                                           colour='green',
                                           disable=not verbose):
 
+            #print(data_paths)
+            if self.unified_filenm in data_paths:
+                data_paths.remove(self.unified_filenm)
+
             for idx, filenm in tqdm(enumerate(data_paths),
                                     desc='Adding paths',
                                     leave=False,
                                     disable=not verbose):
+
                 data_paths[idx] = os.path.join(self.data_dir, filenm) #integrate full path with filename
             
-            data_path = data_paths[0]
+            sentiment_config = {
+                    'model_name' : "seara/rubert-tiny2-russian-sentiment".strip(),
+                    'num_labels' : 3,
+                    'device' : 'cpu',
+                    'output_hidden_states' : False
+                    }
+
+
+            mdl = Sentiment_Model(cfg=sentiment_config)  
+            mdl.eval()
+            #print(data_paths)
 
             for data_path in tqdm(data_paths,
-                                  desc=f'Loading archive {data_path}',
+                                  desc=f'Loading archives',
                                   leave=False,
                                   unit=" files",
-                                  disable=not verbose):
+                                  disable=not verbose,
+                                  initial=checkpoint['data_path']):
 
-                for df in self._prepare_data(data_path, load_func, verbose):
+                for df in tqdm(self._prepare_data(data_path = data_path,
+                                                  load_func=load_func,
+                                                  verbose=verbose),
+                               unit= " files",
+                               leave=False,
+                               disable=not verbose,
+                               initial=checkpoint['df']):
+
+                    #print(df.head(10))
+
+                    df['sentiment'] = 0.
 
                     if 'date' not in df.columns:
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
-                        
+                   
+                    #print(df.columns)
+
+                    #print(pd.unique(df['date']))
+
+                    for dt in tqdm(pd.unique(df['date'].sort_values()),
+                                   unit=" dates",
+                                   leave=False,
+                                   disable=not verbose,
+                                   initial=checkpoint['dt']):
+
+                        texts = df[df['date'] == dt]['text'].to_numpy().reshape(-1).tolist()
+                        #print(len(df[df['date'] == dt]))
+                        #print(texts)
+                        if len(texts):
+                            out = mdl(texts).logits.mean(0)
+                            #print(out)
+                            sentiment_val = (out[0] - out[-1]).item() #positive - negative
+                            #print(sentiment_val)
+                        else:
+                            sentiment_val = 0 #for dt == NaN if that will ever be the case
+                        #print(sentiment_val)
+                        df.loc[df['date'] == dt, 'sentiment'] = sentiment_val
+                        #print(df[df['date'] == dt]['sentiment'])
+                        checkpoint['dt'] += 1
+                        save_checkpoint()
+
                     df.to_csv(path_save,
                               header=False,
                               mode='a',
-                              columns=['date', 'text']
+                              columns=['date', 'text', 'sentiment']
                               )
 
-        return None 
+                    checkpoint['df'] += 1
+                    save_checkpoint()
+
+                checkpoint['data_path'] += 1
+                save_checkpoint()
+
+            checkpoint['load_func'] += 1
+            save_checkpoint()
+
+        return None
 
 
 class Time_Series_Dataset(Abstract_Fin_Dataset):
@@ -246,14 +348,20 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
 
         super().__init__(**self.get_init_args(locals()))
         
-        #self.current_stock = pd.read_csv(self.unified_filenm, nrows=1)['TICKER'].values
-
-    def load(self) -> None:
-        tickers= list(set(trading_listing(status='traded')['SECID'].to_list()))
+    def load(self,
+             st: str = '2020-01-01',
+             end: str = '2026-01-01'
+             ) -> None:
+        
+        tickers= list(
+                set(
+                    trading_listing(status='traded')['SECID'].to_list()
+                    )
+                )
 
         df = history(list(tickers),
-             st='2000-01-01',
-             end='2026-01-01',
+             st=st,
+             end=end,
              max_retries=20,
              retry_pause=4,
              verbose=True)
@@ -264,11 +372,27 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
             sub_df.dropna(axis=0, inplace=True)
             return sub_df
         
-        df = df.T.groupby(level=0).apply(func).reset_index().\
-                rename(columns={'DataFrame' : 'TICKER'}).\
-                set_index('TRADEDATE').drop(columns='level_1').\
-                sort_values('TRADEDATE')
-                
+        cols_to_save = ['TRADEDATE', 'OPEN', 'CLOSE', 'HIGH', 'LOW']
+        df = df.loc[:, pd.IndexSlice[:, cols_to_save]]
+        df.columns = df.columns.map('_'.join)
+
+        date_cols = [col  for col in df.columns if col.endswith('TRADEDATE')]
+
+        df_new = pd.DataFrame({'TRADEDATE' : pd.bdate_range(start=st,
+                                                            end=end)
+                               }
+                              )
+        for col in date_cols:
+            df[col] = pd.to_datetime(df[col])
+            stock_cols = [column for column in df.columns
+                          if column.startswith( col.split('_')[0] )
+                          ]
+            df_new = df_new.merge(df[stock_cols],
+                                  how='left',
+                                  left_on='TRADEDATE',
+                                  right_on=col
+                                  ).drop(columns=[col])
+
         self.num_elements = len(df)
         df.to_csv(self.unified_filenm)
         return None
@@ -278,7 +402,9 @@ class Sentiment_Model(nn.Module, ABC):
     def __init__(self,
                  model_name: str | None = None,
                  num_labels: int | None = None,
+                 batch_size: int = 512,
                  device: str = 'cpu',
+                 output_hidden_states: bool = True,
                  cfg: dict | None = None) -> None:
 
         super().__init__()
@@ -288,12 +414,14 @@ class Sentiment_Model(nn.Module, ABC):
         else:
             self.model_name = model_name
             self.num_labels = num_labels
+            self.batch_size = batch_size
             self.device = device
+            self.output_hidden_states = output_hidden_states
        
         self.mdl = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
             num_labels=self.num_labels,
-            output_hidden_states = True
+            output_hidden_states = self.output_hidden_states
         )
        
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -306,11 +434,15 @@ class Sentiment_Model(nn.Module, ABC):
                 text_inputs, 
                 return_tensors="pt", 
                 truncation=True, 
-                padding=True
+                padding=True,
+                max_length = 512
             ).to(self.device)
 
-        outs = self.mdl(**tokenized_inputs)
-        return outs
+        #print(tokenized_inputs)
+
+        outs = self.mdl.forward(**tokenized_inputs)
+        outs.logits = F.softmax(outs.logits, dim=1)
+        return outs 
 
 class Quantum_Encoder(nn.Module):
 
@@ -715,7 +847,8 @@ if __name__ == '__main__':
     sentiment_config = {
             'model_name' : "blanchefort/rubert-base-cased-sentiment".strip(),
             'num_labels' : 3,
-            'device' : 'cpu'
+            'device' : 'cpu',
+            'output_hidden_states' : True
             }
 
 
@@ -768,26 +901,42 @@ if __name__ == '__main__':
 
     path_news_data = os.path.join('..', 'data', 'news_data')
     news_data = News_Dataset(path_news_data,
-                             load_from_file=True,
+                             load_from_file=False,
                              delete_old=False)
 
+    news_batch_size = 32
+    news_dataloader = DataLoader(news_data,
+                                 batch_size=news_batch_size,
+                                 shuffle=True)
 
     path_time_series_data = os.path.join('..', 'data', 'stock_data')
     time_series_inputs = Time_Series_Dataset(path_time_series_data,
-                                             load_from_file=True,
+                                             load_from_file=False,
                                              delete_old=True)
 
-    # News input – dummy token IDs (batch, num_articles, seq_len_text)
-    news_inputs = ['this is good', 'this is bad', 'nice', 'really bad']
+    time_series_batch_size = 16
+    time_series_dataloader = DataLoader(time_series_inputs,
+                                        batch_size=time_series_batch_size,
+                                        shuffle=True)
 
-    # ---------- Forward pass ----------
-    output = combined_model(time_series_inputs, news_inputs)
-    print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
 
-    # ---------- Simple backward pass ----------
-    target = torch.randn(batch_size, prediction_length)
-    loss = nn.MSELoss()(output, target)
-    loss.backward()
-    print("Backward pass completed. Gradients exist:", any(
-        p.grad is not None for p in combined_model.parameters()
-    ))
+    num_epochs = 10
+
+
+    #TODO: finish the data pipeline to have a unified dataset to load from. Preprocess news into sentiment values for each date
+    for epoch in num_epochs:
+
+        #TODO: fix later
+        for news_inputs, time_series_inputs, targets in zip_longest(news_dataloader,
+                                                       time_series_dataloader
+                                                       ):
+
+            output = combined_model(time_series_inputs, news_inputs)
+            print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
+
+            target = torch.randn(batch_size, prediction_length)
+            loss = nn.MSELoss()(output, target)
+            loss.backward()
+            print("Backward pass completed. Gradients exist:", any(
+                p.grad is not None for p in combined_model.parameters()
+            ))
