@@ -171,16 +171,17 @@ class News_Dataset(Abstract_Fin_Dataset):
 
                         print(data[-1].__attributes__)
 
-                        columns = [col for col in data[-1].__attributes__
-                                            if col in ['date', 'text']
-                                   ]
+                        columns = ['date', 'text']
                          
                         df = pd.DataFrame(data, columns=data[-1].__attributes__)
                         
-                        if 'date' not in df.columns and 'timestamp' in df.columns:
+                        if 'timestamp' in df.columns:
                             df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
                                                                                x.date()
                                                                                )
+                            print('!')
+
+
                         if pd.unique(df['date'])[0] == None:
 
                             #attempt to reconstruct date from url, drop values that can't be converted 
@@ -206,7 +207,6 @@ class News_Dataset(Abstract_Fin_Dataset):
 
 
     def load(self,
-             mdl_nm: str = 'seara/rubert-tiny2-russian-sentiment',
              verbose: bool = True
              ) -> None:
 
@@ -283,12 +283,14 @@ class News_Dataset(Abstract_Fin_Dataset):
                 for df in tqdm(self._prepare_data(data_path = data_path,
                                                   load_func=load_func,
                                                   verbose=verbose),
-                               unit= " files",
+                               unit= " lines",
                                leave=False,
-                               disable=not verbose,
-                               initial=checkpoint['df']):
+                               disable=not verbose#,
+                               #initial=checkpoint['df']
+                               ):
 
-                    
+                    print(df.head())
+
                     total_nans += len(df[df["date"].isna()])
                     
                     df = df.dropna(subset='date')
