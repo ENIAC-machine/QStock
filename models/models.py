@@ -243,9 +243,11 @@ class News_Dataset(Abstract_Fin_Dataset):
                 pickle.dump(checkpoint, file)
             return None
 
-        for load_func, data_paths in tqdm(func_to_data.items()[checkpoint['load_func']],
+        total_nans = 0
+
+        for load_func, data_paths in tqdm(func_to_data.items(),
                                           desc='Loading data',
-       unit=' file batches',
+                                          unit=' file batches',
                                           colour='green',
                                           disable=not verbose):
 
@@ -273,7 +275,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                                   disable=not verbose,
                                   initial=checkpoint['data_path']):
 
-                 for df in tqdm(self._prepare_data(data_path = data_path,
+                for df in tqdm(self._prepare_data(data_path = data_path,
                                                   load_func=load_func,
                                                   verbose=verbose),
                                unit= " files",
@@ -283,14 +285,19 @@ class News_Dataset(Abstract_Fin_Dataset):
 
                     if 'date' not in df.columns:
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
-                
+               
+
+
+                    total_nans += len(df[df["date"].isna()])
+                    
+                    df = df.dropna(subset='date')
+                    '''
                     print(f'{data_path}\n\n{df}')
                     ans = input('break?')
 
                     if ans == 'yes':
                         break
-                    
-                    df = df.ffill()
+                    '''
 
                     df.to_csv(self.unified_filepath,
                              header=False,
@@ -304,6 +311,8 @@ class News_Dataset(Abstract_Fin_Dataset):
             else:
                 continue
             break
+
+        print(f'Total nans found: {total_nans}')
 
         return None
 
