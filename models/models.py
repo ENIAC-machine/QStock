@@ -176,7 +176,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                                    ]
                     
                         df = pd.DataFrame(data, columns=data[-1].__attributes__)
-                        if pd.unique(df['date']) == None:
+                        if pd.unique(df['date'])[0] == None:
 
                             #attempt to reconstruct date from url, drop values that can't be converted 
                             df['date'] = pd.to_datetime(df['url'].apply(lambda x: '/'.join(x.split('news/')[-1].\
