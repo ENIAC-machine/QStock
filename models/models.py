@@ -172,28 +172,28 @@ class News_Dataset(Abstract_Fin_Dataset):
                         print(data[-1].__attributes__)
 
                         columns = [col for col in data[-1].__attributes__
-                                            if col in ['date', 'text', 'timestamp']
+                                            if col in ['date', 'text']
                                    ]
                          
                         df = pd.DataFrame(data, columns=data[-1].__attributes__)
                         
-                        if 'date' not in columns and 'timestamp' in columns:
+                        if 'date' not in df.columns and 'timestamp' in df.columns:
                             df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
                                                                                x.date()
                                                                                )
                         if pd.unique(df['date'])[0] == None:
 
                             #attempt to reconstruct date from url, drop values that can't be converted 
-                            df['date'] = pd.to_datetime(df['url'].apply(lambda x: '/'.join(x.split('news/')[-1].\
-                                                                                             split('/')[:3]
-                                                                                           )
-                                                                        ),
-                                                        errors='coerce'
-                                                        ).dropna(how='any',
-                                                                 axis=0
-                                                                 ).reset_index(drop=True).apply(lambda x:x.date())
+                            df['date'] = pd.to_datetime(
+                                            df['url'].apply(lambda x:'/'.join(
+                                                x.split('news/')[-1].split('/')[:3])
+                                                            ),
+                                            errors='coerce'
+                                            ).dropna(how='any',
+                                            axis=0
+                                            ).reset_index(drop=True).apply(lambda x:x.date())
                         df = df[columns]
-                        
+                    
                         yield df 
                         
                         lines_cnt += df.shape[0]
