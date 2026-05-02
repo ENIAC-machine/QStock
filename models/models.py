@@ -174,7 +174,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                         columns = [col for col in data[-1].__attributes__
                                             if col in ['date', 'text', 'timestamp']
                                    ]
-                        if 'date' not in df.columns and 'timestamp' in columns:
+                        if 'date' not in columns and 'timestamp' in columns:
                             df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
                                                                                x.date()
                                                                                )
