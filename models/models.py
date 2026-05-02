@@ -174,13 +174,13 @@ class News_Dataset(Abstract_Fin_Dataset):
                         columns = [col for col in data[-1].__attributes__
                                             if col in ['date', 'text', 'timestamp']
                                    ]
+                         
+                        df = pd.DataFrame(data, columns=data[-1].__attributes__)
+                        
                         if 'date' not in columns and 'timestamp' in columns:
                             df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
                                                                                x.date()
                                                                                )
-               
- 
-                        df = pd.DataFrame(data, columns=data[-1].__attributes__)
                         if pd.unique(df['date'])[0] == None:
 
                             #attempt to reconstruct date from url, drop values that can't be converted 
