@@ -161,13 +161,16 @@ class News_Dataset(Abstract_Fin_Dataset):
                         if data is None or len(data) == 0:
                             break
 
+                        print(data[-1].__attributes__)
+
                         columns = [col for col in data[-1].__attributes__
                                             if col in ['date', 'text', 'timestamp']
                                    ]
                     
                         df = pd.DataFrame(data,
-                                          columns=data[-1].__attributes__)[columns]
-                        yield df 
+                                          columns=data[-1].__attributes__)
+                        print(df.head())
+                        yield df[columns] 
                         
                         lines_cnt += df.shape[0]
                         self.num_elements += df.shape[0]
@@ -236,6 +239,12 @@ class News_Dataset(Abstract_Fin_Dataset):
                     if 'date' not in df.columns:
                         df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
                 
+                    print(f'{data_path}\n\n{df}')
+                    ans = input('break?')
+
+                    if ans == 'yes':
+                        break
+                    
                     df = df.ffill()
 
                     df.to_csv(self.unified_filepath,
@@ -243,6 +252,13 @@ class News_Dataset(Abstract_Fin_Dataset):
                               mode='a',
                               columns=['date', 'text']
                               )
+                else:
+                    continue
+                break
+
+            else:
+                continue
+            break
 
         return None 
 
