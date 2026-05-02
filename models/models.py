@@ -174,7 +174,12 @@ class News_Dataset(Abstract_Fin_Dataset):
                         columns = [col for col in data[-1].__attributes__
                                             if col in ['date', 'text', 'timestamp']
                                    ]
-                    
+                        if 'date' not in df.columns and 'timestamp' in columns:
+                            df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
+                                                                               x.date()
+                                                                               )
+               
+ 
                         df = pd.DataFrame(data, columns=data[-1].__attributes__)
                         if pd.unique(df['date'])[0] == None:
 
@@ -283,11 +288,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                                disable=not verbose,
                                initial=checkpoint['df']):
 
-                    if 'date' not in df.columns:
-                        df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x: x.date())
-               
-
-
+                    
                     total_nans += len(df[df["date"].isna()])
                     
                     df = df.dropna(subset='date')
