@@ -4,7 +4,11 @@
 *.bz2
 *.sql
 
+#ignore all the files from merge
+*.orig
+
 #self-explanatory
 auth_token.txt
 .*
+
 !/.gitignore
