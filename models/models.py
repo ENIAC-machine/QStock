@@ -142,69 +142,75 @@ class News_Dataset(Abstract_Fin_Dataset):
         #print(end)
 
         #print(f'data_path={data_path}')
-        match end:
+        try:
+            match end:
 
-            case 'csv':
+                case 'csv':
 
-                reader = load_func(data_path, chunksize=self.slice_size)
-                for df in tqdm(reader,
-                               desc='Loading DataFrame chunks',
-                               leave=False,
-                               disable=not verbose,
-                               unit=' chunks'):
-                    self.num_elements += df.shape[0]
-                    yield df
-
-
-            case 'gz' | 'bz2' | 'sql':
-
-                #make the object an iterable for the `islice` function to work
-                gen = iter(load_func(data_path))
-                
-                lines_cnt = 0
-                with tqdm(unit=' lines', leave=False, disable=not verbose) as progress:
-                    while True: #because we don't know the num of elements in the generator
-                        data = list(islice(gen, self.slice_size))
-                        
-                        if data is None or len(data) == 0:
-                            break
-
-                        print(data[-1].__attributes__)
-
-                        columns = ['date', 'text']
-                         
-                        df = pd.DataFrame(data, columns=data[-1].__attributes__)
-                        
-                        if 'timestamp' in df.columns:
-                            df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
-                                                                               x.date()
-                                                                               )
-                            print('!')
-
-
-                        if pd.unique(df['date'])[0] == None:
-
-                            #attempt to reconstruct date from url, drop values that can't be converted 
-                            df['date'] = pd.to_datetime(
-                                            df['url'].apply(lambda x:'/'.join(
-                                                x.split('news/')[-1].split('/')[:3])
-                                                            ),
-                                            errors='coerce'
-                                            ).dropna(how='any',
-                                            axis=0
-                                            ).reset_index(drop=True).apply(lambda x:x.date())
-                        df = df[columns]
-                    
-                        yield df 
-                        
-                        lines_cnt += df.shape[0]
+                    reader = load_func(data_path, chunksize=self.slice_size)
+                    for df in tqdm(reader,
+                                   desc='Loading DataFrame chunks',
+                                   leave=False,
+                                   disable=not verbose,
+                                   unit=' chunks'):
                         self.num_elements += df.shape[0]
-                        progress.update(self.slice_size) 
+                        yield df
 
-            case _:
-                print(f'Unknown datatype to process: {data_path.split(".")}')
-                yield None
 
+                case 'gz' | 'bz2' | 'sql':
+
+                    #make the object an iterable for the `islice` function to work
+                    gen = iter(load_func(data_path))
+                    
+                    lines_cnt = 0
+                    with tqdm(unit=' lines', leave=False, disable=not verbose) as progress:
+                        while True: #because we don't know the num of elements in the generator
+                            data = list(islice(gen, self.slice_size))
+                            
+                            if data is None or len(data) == 0:
+                                break
+
+                            print(data[-1].__attributes__)
+
+                            columns = ['date', 'text']
+                             
+                            df = pd.DataFrame(data, columns=data[-1].__attributes__)
+                            
+                            if 'timestamp' in df.columns:
+                                df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
+                                                                                   x.date()
+                                                                                   )
+                                print('!')
+
+
+                            if pd.unique(df['date'])[0] == None:
+
+                                #attempt to reconstruct date from url, drop values that can't be converted 
+                                df['date'] = pd.to_datetime(
+                                                df['url'].apply(lambda x:'/'.join(
+                                                    x.split('news/')[-1].split('/')[:3])
+                                                                ),
+                                                errors='coerce'
+                                                ).dropna(how='any',
+                                                axis=0
+                                                ).reset_index(drop=True).apply(lambda x:x.date())
+                            df = df[columns]
+                        
+                            yield df 
+                            
+                            lines_cnt += df.shape[0]
+                            self.num_elements += df.shape[0]
+                            progress.update(self.slice_size) 
+
+                case _:
+                    if verbose:
+                        print(f'Unknown datatype to process: {data_path.split(".")}')
+                    yield None
+
+        except:
+            if verbose:
+                print(f'Load failed for file {data_path} with loading function {load_func}')
+            yield None
 
     def load(self,
              verbose: bool = True
@@ -288,6 +294,9 @@ class News_Dataset(Abstract_Fin_Dataset):
                                disable=not verbose#,
                                #initial=checkpoint['df']
                                ):
+
+                    if df is None:
+                        continue
 
                     print(df.head())
 
@@ -432,16 +441,16 @@ class Sentiment_Model(nn.Module, ABC):
 
         super().__init__()
 
+    
+        self.model_name = model_name
+        self.num_labels = num_labels
+        self.batch_size = batch_size
+        self.device = device
+        self.score = score
+        self.output_hidden_states = output_hidden_states
         if isinstance(cfg, dict):
             self.__dict__.update(cfg)
-        else:
-            self.model_name = model_name
-            self.num_labels = num_labels
-            self.batch_size = batch_size
-            self.device = device
-            self.score = score
-            self.output_hidden_states = output_hidden_states
-       
+
         self.mdl = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
             num_labels=self.num_labels,
