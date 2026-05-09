@@ -997,8 +997,7 @@ if __name__ == '__main__':
     news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
     '''
     time_series_inputs = Time_Series_Dataset(load_from_file=False,
-                                             delete_old=True,
-                                             verbose=True)
+                                             delete_old=True)
 
     time_series_batch_size = 16
     time_series_dataloader = DataLoader(time_series_inputs,
