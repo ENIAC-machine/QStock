@@ -118,6 +118,9 @@ class News_Dataset(Abstract_Fin_Dataset):
 
         super().__init__(**self.get_init_args(local_vars))
 
+        #fills during the .to_sentiment method
+        self.sentiment_filepath: str = None
+
     def _prepare_data(self,
                       load_func: Callable,
                       data_path: str | Path | None = None,
@@ -289,7 +292,7 @@ class News_Dataset(Abstract_Fin_Dataset):
                 for df in tqdm(self._prepare_data(data_path = data_path,
                                                   load_func=load_func,
                                                   verbose=verbose),
-                               unit= " lines",
+                               unit= " batches",
                                leave=False,
                                disable=not verbose#,
                                #initial=checkpoint['df']
@@ -335,9 +338,11 @@ class News_Dataset(Abstract_Fin_Dataset):
                      verbose: bool = True
                      )->None:
         
-        if new_filepath is None:
-            new_filepath = self.unified_filepath.split('.')[0] + '_sentiment.csv'
+        if sentiment_filepath is None:
+            sentiment_filepath = Path(self.unified_filepath).with_name('all_data_sentiment.csv')
         
+        self.sentiment_filepath = sentiment_filepath
+
         mdl = Sentiment_Model(cfg=mdl_cfg)
         mdl.eval()
 
@@ -367,6 +372,31 @@ class News_Dataset(Abstract_Fin_Dataset):
                           )
             return None
 
+        #TODO: make the case for low memory, or just rewrite to polars
+        def agg(self,
+                agg_func: str | Callable = 'mean',
+                verbose: bool = False
+                ) -> pd.DataFrame:
+            ''' 
+            Aggregates the data for the sentiment
+            '''
+
+            df = pd.read_csv(self.sentiment_filepath, index_col)
+
+            #just in case there will be unnamed cols due to indices and stuff
+            df.drop(columns=[col for col in df.columns if 'Unnamed' in col])
+
+            agg_sentiment_path = Path(self.sentiment_filepath).with_name('agg_sentiment.csv')
+            if verbose:
+                print('Aggregating data...')
+            df_new = df.groupby(by='date').mean()
+            if verbose:
+                print('Data aggregated, converting into .csv format...')
+
+            df_new.to_csv(agg_sentiment_path)
+            
+            return df_new
+            
 class Time_Series_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
@@ -380,13 +410,13 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         super().__init__(**self.get_init_args(locals()))
         
     def load(self,
-             st: str = '2020-01-01',
-             end: str = '2026-01-01'
+             st: str = '2014-01-01',
+             end: str = '2020-01-01'
              ) -> None:
         
         tickers= list(
                 set(
-                    trading_listing(status='traded')['SECID'].to_list()
+                    trading_listing()['SECID'].to_list()
                     )
                 )
 
@@ -954,20 +984,21 @@ if __name__ == '__main__':
 
     #JOPA = TS_JOPA(combined_model, sentiment_model)
 
-    print("Combined model instantiated successfully.")
+    #print("Combined model instantiated successfully.")
 
     # ---------- Prepare data ----------
 
+    '''
     path_news_data = os.path.join('..', 'data', 'news_data')
     news_data = News_Dataset(path_news_data,
                              load_from_file=False,
                              delete_old=True)
 
     news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
-    path_time_series_data = os.path.join('..', 'data', 'stock_data')
-    time_series_inputs = Time_Series_Dataset(path_time_series_data,
-                                             load_from_file=False,
-                                             delete_old=True)
+    '''
+    time_series_inputs = Time_Series_Dataset(load_from_file=False,
+                                             delete_old=True,
+                                             verbose=True)
 
     time_series_batch_size = 16
     time_series_dataloader = DataLoader(time_series_inputs,
