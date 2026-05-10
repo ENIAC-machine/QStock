@@ -402,7 +402,7 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data', 'stock_data'),
                  batch_size: int = 32,
-                 unified_filenm: str = 'stock_data.csv',
+                 unified_filenm: str = os.path.join('..', 'data', 'stock_data', 'stock_data.csv'),
                  load_from_file: bool = True,
                  delete_old: bool = True,
                  ) -> None:
@@ -411,21 +411,31 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         
     def load(self,
              st: str = '2014-01-01',
-             end: str = '2020-01-01'
+             end: str = '2026-01-01'
              ) -> None:
-        
+       
+        '''
         tickers= list(
                 set(
                     trading_listing()['SECID'].to_list()
                     )
-                )
+                )[:10]
+        '''
+
+        tickers = ['GAZP', 'YNDX', 'NVTK', 'SBER', 'VTBR', 'LKOH', 'GMKN', 'NLMK', 'MGNT', 'AFKS', 'AFLT', 'MTSS', 'HYDR', 'FEES', 'ALRS', 'PLZL', 'CHMF', 'MAGN', 'MOEX', 'TATN', 'SNGS']
 
         df = history(list(tickers),
              st=st,
              end=end,
              max_retries=20,
-             retry_pause=4,
+             retry_pause=10,
              verbose=True)
+
+        #print(df.shape)
+        #print(df.columns)
+        #print(df[('GAZP', 'TRADEDATE')][df[('GAZP', 'CLOSE')].isna()])
+        #print(df.head())
+
 
         def func(sub_df):
             sub_df = sub_df.T.droplevel(axis=1, level=0)
@@ -454,8 +464,11 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
                                   right_on=col
                                   ).drop(columns=[col])
 
+        df_new = df_new.dropna(axis=0, how='any').reset_index(drop=True)
+        print(df_new.shape)
+        print(df_new.head())
         self.num_elements = len(df)
-        df.to_csv(self.unified_filenm)
+        df_new.to_csv(self.unified_filenm)
         return None
 
 class Sentiment_Model(nn.Module, ABC):
@@ -995,6 +1008,7 @@ if __name__ == '__main__':
                              delete_old=True)
 
     news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
+    news_dataloaer = DataLoader(news_data, batch_size=32)
     '''
     time_series_inputs = Time_Series_Dataset(load_from_file=False,
                                              delete_old=True)
@@ -1002,13 +1016,13 @@ if __name__ == '__main__':
     time_series_batch_size = 16
     time_series_dataloader = DataLoader(time_series_inputs,
                                         batch_size=time_series_batch_size,
-                                        shuffle=True)
+                                        shuffle=False)
 
     num_epochs = 10
 
 
     #TODO: finish the data pipeline to have a unified dataset to load from. Preprocess news into sentiment values for each date
-    for epoch in num_epochs:
+    for epoch in range(num_epochs):
 
         #TODO: fix later
         for news_inputs, time_series_inputs, targets in zip_longest(news_dataloader,
