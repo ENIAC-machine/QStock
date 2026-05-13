@@ -405,7 +405,9 @@ class News_Dataset(Abstract_Fin_Dataset):
                 print('Data aggregated, converting into .csv format...')
 
             df_new.to_csv(agg_sentiment_path)
-            
+
+            #reset the path to fetch data
+            self.unified_filenm =  agg_sentiment_path   
             return df_new
             
 class Time_Series_Dataset(Abstract_Fin_Dataset):
@@ -1058,6 +1060,7 @@ if __name__ == '__main__':
                              delete_old=True)
 
     news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
+    news_data.agg(verbose= True)
     news_dataloader = DataLoader(news_data, batch_size=32)
     
     time_series_inputs = Time_Series_Dataset(lookback=seq_len,
