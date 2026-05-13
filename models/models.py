@@ -106,7 +106,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
 
     def __getitem__(self, idx: int) -> list[Any]:
         return pd.read_csv(self.unified_filenm,
-                           skip_rows=idx,
+                           skiprows=idx,
                            nrows=1
                            ).iloc[0, :].to_list()
 
@@ -485,12 +485,9 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         print(df_new.head())
         self.num_elements = len(df)
         df_new.to_csv(self.unified_filenm)
-        self.size = len(range(len(df_new) - self.lookback - self.horizon + 1))
-        self.shape = (self.size, df_new.shape[1])
+        self.num_elements = len(range(len(df_new) - self.lookback - self.horizon + 1))
+        self.shape: tuple = (self.num_elements, df_new.shape[1])
         return None
-
-    def __len__(self) -> int:
-        return self.size
 
     def __getitem__(self, idx: int, dates: bool = False) -> (torch.Tensor, torch.Tensor):
         
