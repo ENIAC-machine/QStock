@@ -1,5 +1,4 @@
 import os
-import pickle
 os.environ["USE_TF"] = "NO"
 os.environ["USE_TORCH"] = "YES"
 
@@ -9,6 +8,8 @@ filterwarnings('ignore')
 
 
 import sys
+import pickle
+import inspect
 import numpy as np
 import pandas as pd
 import torch
@@ -72,11 +73,18 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         if not load_from_file:
             self.load()
 
-    @staticmethod
-    def get_init_args(local_vars: dict) -> dict:
+    def get_init_args(self, local_vars: dict) -> dict:
         kwargs = local_vars.copy()
         kwargs.pop('self', None)
         kwargs.pop('__class__', None)
+        self.__dict__.update(kwargs)
+        init_vars = set(
+                [param.name for param in 
+                 inspect.signature(Abstract_Fin_Dataset.__init__).parameters.values() 
+                 if param.name != 'self']
+                )
+        #print(init_vars)
+        kwargs = {key : val for key, val in kwargs.items() if key in init_vars}
         return kwargs
 
     @abstractmethod
@@ -117,8 +125,9 @@ class News_Dataset(Abstract_Fin_Dataset):
         local_vars = locals()
         local_vars.pop('slice_size')
 
+        self.get_init_args(local_vars)
         super().__init__(**self.get_init_args(local_vars))
-
+    
         #fills during the .to_sentiment method
         self.sentiment_filepath: str = None
 
@@ -404,11 +413,14 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
     def __init__(self,
                  data_dir: str | Path = os.path.join('..', 'data', 'stock_data'),
                  batch_size: int = 32,
+                 lookback: int = 10,
+                 horizon: int = 10,
                  unified_filenm: str = os.path.join('..', 'data', 'stock_data', 'stock_data.csv'),
                  load_from_file: bool = True,
                  delete_old: bool = True,
                  ) -> None:
 
+        #self.get_init_args(locals()) 
         super().__init__(**self.get_init_args(locals()))
         
     def load(self,
@@ -425,6 +437,8 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         '''
 
         tickers = ['GAZP', 'YNDX', 'NVTK', 'SBER', 'VTBR', 'LKOH', 'GMKN', 'NLMK', 'MGNT', 'AFKS', 'AFLT', 'MTSS', 'HYDR', 'FEES', 'ALRS', 'PLZL', 'CHMF', 'MAGN', 'MOEX', 'TATN', 'SNGS']
+
+        tickers = tickers[:2]
 
         df = history(list(tickers),
              st=st,
@@ -471,7 +485,36 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         print(df_new.head())
         self.num_elements = len(df)
         df_new.to_csv(self.unified_filenm)
+        self.size = len(range(len(df_new) - self.lookback - self.horizon + 1))
+        self.shape = (self.size, df_new.shape[1])
         return None
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int, dates: bool = False) -> (torch.Tensor, torch.Tensor):
+        
+        x = pd.read_csv(self.unified_filenm,
+                        skiprows=min(0, idx-self.lookback),
+                        nrows=self.lookback,
+                        index_col=0,
+                        usecols=list(range(self.shape[1]))#[(0 if dates else 1):]
+                        )
+
+        y = pd.read_csv(self.unified_filenm,
+                        skiprows=min(0, idx),
+                        nrows=self.horizon,
+                        usecols=list(range(self.shape[1]))[0 if dates else 1:]
+                        )
+
+        if dates:
+            return x, y
+        
+        else:
+            x, y = torch.Tensor(x.to_numpy()[:, int(not dates):].astype(float)),\
+                    torch.Tensor(y.to_numpy()[:, int(not dates):].astype(float))
+
+            return x, y
 
 class Sentiment_Model(nn.Module, ABC):
 
@@ -941,7 +984,7 @@ if __name__ == '__main__':
     batch_size = 4
     seq_len = 10               # time series sequence length
     num_features = 5
-    prediction_length = 2
+    prediction_length = 10
     d_model = 8                # hidden dimension for PatchTST
 
     # Time series config (PatchTST)
@@ -1011,16 +1054,18 @@ if __name__ == '__main__':
 
     # ---------- Prepare data ----------
 
-    '''
+    
     path_news_data = os.path.join('..', 'data', 'news_data')
     news_data = News_Dataset(path_news_data,
                              load_from_file=False,
                              delete_old=True)
 
     news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
-    news_dataloaer = DataLoader(news_data, batch_size=32)
-    '''
-    time_series_inputs = Time_Series_Dataset(load_from_file=False,
+    news_dataloader = DataLoader(news_data, batch_size=32)
+    
+    time_series_inputs = Time_Series_Dataset(lookback=seq_len,
+                                             horizon=prediction_length,
+                                             load_from_file=False,
                                              delete_old=True)
 
     time_series_batch_size = 16
@@ -1035,16 +1080,24 @@ if __name__ == '__main__':
     for epoch in range(num_epochs):
 
         #TODO: fix later
-        for news_inputs, time_series_inputs, targets in zip_longest(news_dataloader,
-                                                       time_series_dataloader
-                                                       ):
+        for news_inputs, (time_series_inputs, targets) in zip(news_dataloader,
+                                                            time_series_dataloader
+                                                            ):
+
+            print(f'{time_series_inputs}\n\n\n{targets}')
 
             output = combined_model(time_series_inputs, news_inputs)
             print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
 
-            target = torch.randn(batch_size, prediction_length)
-            loss = nn.MSELoss()(output, target)
+            loss = nn.MSELoss()(output, targets)
             loss.backward()
             print("Backward pass completed. Gradients exist:", any(
                 p.grad is not None for p in combined_model.parameters()
             ))
+
+            break
+        
+        else:
+            continue
+        
+        break
