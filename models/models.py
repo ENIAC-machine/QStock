@@ -1,4 +1,5 @@
 import os
+import pickle
 os.environ["USE_TF"] = "NO"
 os.environ["USE_TORCH"] = "YES"
 
@@ -30,7 +31,7 @@ from tqdm import tqdm
 from moex_api.history import history, trading_listing
 
 from pathlib import Path
-from typing import Callable, Generator, Any, Iterable, Sequence, Annotated
+from typing import Callable, Generator, Any, Iterable, Sequence, Annotated, Literal
 from abc import abstractmethod, ABC
 
 NEWS_DATA_DIR = os.path.join('..', 'data', 'news_data')
@@ -97,9 +98,9 @@ class Abstract_Fin_Dataset(Dataset, ABC):
 
     def __getitem__(self, idx: int) -> list[Any]:
         return pd.read_csv(self.unified_filenm,
-                           skip_rows= idx,
+                           skip_rows=idx,
                            nrows=1
-                           ).iloc[idx, :].to_list()
+                           ).iloc[0, :].to_list()
 
 class News_Dataset(Abstract_Fin_Dataset):
 
@@ -338,10 +339,10 @@ class News_Dataset(Abstract_Fin_Dataset):
                      verbose: bool = True
                      )->None:
         
-        if sentiment_filepath is None:
-            sentiment_filepath = Path(self.unified_filepath).with_name('all_data_sentiment.csv')
+        if new_filepath is None:
+            new_filepath = Path(self.unified_filepath).with_name('all_data_sentiment.csv')
         
-        self.sentiment_filepath = sentiment_filepath
+        self.sentiment_filepath = new_filepath
 
         mdl = Sentiment_Model(cfg=mdl_cfg)
         mdl.eval()
@@ -381,7 +382,8 @@ class News_Dataset(Abstract_Fin_Dataset):
             Aggregates the data for the sentiment
             '''
 
-            df = pd.read_csv(self.sentiment_filepath, index_col)
+            #here I reset and drop 'index' cause the index col may be 'date' or smth
+            df = pd.read_csv(self.sentiment_filepath).reset_index(drop=False).drop(columns='index')
 
             #just in case there will be unnamed cols due to indices and stuff
             df.drop(columns=[col for col in df.columns if 'Unnamed' in col])
@@ -508,7 +510,8 @@ class Sentiment_Model(nn.Module, ABC):
 
     #TODO: add desc for torch.Tensor
     def forward(self,
-                text_inputs: torch.Tensor) -> torch.Tensor:
+                text_inputs: Iterable[str]
+               ) -> torch.Tensor:
         
         tokenized_inputs = self.tokenizer(
                 text_inputs, 
@@ -527,6 +530,7 @@ class Sentiment_Model(nn.Module, ABC):
             return probs
         else:
             return outs
+
 class Quantum_Encoder(nn.Module):
 
     def __init__(self,
@@ -587,13 +591,16 @@ class Quantum_Encoder(nn.Module):
 
             case 'QAOA':
 
-                self.weights_shape = qml.QAOAEmbedding(n_layers=self.n_layers,
-                                                       n_wires=len(self.wires)
-                                                       )
+                self.weights_shape: tuple[int] = qml.QAOAEmbedding.shape(n_layers=self.n_layers,
+                                                                         n_wires=len(self.wires)
+                                                                        )
+
+            case _:
+                raise NotImplementedError
  
 
     def _init_circuit(self,
-                     weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] | str | None = None
+                     weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] | str = None
                      ) -> Callable:
         ''' 
         
@@ -635,10 +642,13 @@ class Quantum_Encoder(nn.Module):
                 #here weights are for compatibility, they don't serve any meaningful purpose
                 @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
                 def circuit(features: Sequence,
-                            weights: None = None,
+                            weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] = None,
                             pad_val: complex = self.pad_val,
                             **kwargs
                             ) -> torch.Tensor:
+
+                    if weights is None:
+                        weights = nn.Parameter(torch.randn(self.weights_shape))
 
                     qml.AmplitudeEmbedding(features,
                                            wires=self.wires,
@@ -759,7 +769,7 @@ class Quantum_Kernel(nn.Module):
 
         #TODO: update for SimplifiedTwoDesign compatibility
         layer_config = {'weights' : kernel_weights,
-                        'wires' : self.encoder.wires
+                        'wires' : self.encoder.wires if self.encoder else self.wires
                         }
 
         if self.encoder is not None:
@@ -837,11 +847,9 @@ class TS_JOPA(nn.Module):
         #compare the number of qubits needed to fully encompass the embed dim vs the max allowed register size
         self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1,
                             self.max_quantum_register_size)
-        
+       
         if self.n_qubits > self.max_quantum_register_size:
-            self.num_registers= 0
-            for _ in range((1 << self.n_qubits) - 1, quantum_dim, quantum_stride):
-                num_registers += 1
+            self.num_registers = range((1 << self.n_qubits) - 1, quantum_dim, quantum_stride)
         else:
             self.num_registers = 1
 
@@ -887,6 +895,8 @@ class TS_JOPA(nn.Module):
         ts_out = self.time_series_model(time_series_inputs).hidden_states[self.hidden_dim] #(batch, n_patches, embed_size, d_model)
         ts_out_agg = ts_out.mean(dim=(1,2))
         #print(f'Time-series embeds: {ts_out_agg.shape}')
+
+        combined = torch.cat([ts_out_agg, sentiment], dim=1)
         
         if ts_out_agg.shape[1] < self.quantum_dim:
             pad = torch.zeros(self.batch_size,
