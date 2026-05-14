@@ -382,34 +382,34 @@ class News_Dataset(Abstract_Fin_Dataset):
                           )
             return None
 
-        #TODO: make the case for low memory, or just rewrite to polars
-        def agg(self,
-                agg_func: str | Callable = 'mean',
-                verbose: bool = False
-                ) -> pd.DataFrame:
-            ''' 
-            Aggregates the data for the sentiment
-            '''
+    #TODO: make the case for low memory, or just rewrite to polars
+    def agg(self,
+            agg_func: str | Callable = 'mean',
+            verbose: bool = False
+            ) -> pd.DataFrame:
+        ''' 
+        Aggregates the data for the sentiment
+        '''
 
-            #here I reset and drop 'index' cause the index col may be 'date' or smth
-            df = pd.read_csv(self.sentiment_filepath).reset_index(drop=False).drop(columns='index')
+        #here I reset and drop 'index' cause the index col may be 'date' or smth
+        df = pd.read_csv(self.sentiment_filepath).reset_index(drop=False).drop(columns='index')
 
-            #just in case there will be unnamed cols due to indices and stuff
-            df.drop(columns=[col for col in df.columns if 'Unnamed' in col])
+        #just in case there will be unnamed cols due to indices and stuff
+        df.drop(columns=[col for col in df.columns if 'Unnamed' in col])
 
-            agg_sentiment_path = Path(self.sentiment_filepath).with_name('agg_sentiment.csv')
-            if verbose:
-                print('Aggregating data...')
-            df_new = df.groupby(by='date').mean()
-            if verbose:
-                print('Data aggregated, converting into .csv format...')
+        agg_sentiment_path = Path(self.sentiment_filepath).with_name('agg_sentiment.csv')
+        if verbose:
+            print('Aggregating data...')
+        df_new = df.groupby(by='date').mean()
+        if verbose:
+            print('Data aggregated, converting into .csv format...')
 
-            df_new.to_csv(agg_sentiment_path)
+        df_new.to_csv(agg_sentiment_path)
 
-            #reset the path to fetch data
-            self.unified_filenm =  agg_sentiment_path   
-            return df_new
-            
+        #reset the path to fetch data
+        self.unified_filenm =  agg_sentiment_path   
+        return df_new
+        
 class Time_Series_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
