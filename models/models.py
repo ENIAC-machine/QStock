@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Callable, Generator, Any, Iterable, Sequence, Annotated, Literal
 from abc import abstractmethod, ABC
 
-NEWS_DATA_DIR = os.path.join('..', 'data', 'news_data')
+NEWS_DATA_DIR = os.path.join('..', 'data')
 
 #global variable to map preprocessing functions to the files
 func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
@@ -156,7 +156,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
 
     def _prepare_data(self,
                       load_func: Callable,
-                      data_path: str | Path | None = None,
+                      data_path: str | Path = None,
                       verbose: bool = True
                       ):# -> Generator[pd.DataFrame | None]:
 
@@ -538,7 +538,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
 class News_Dataset(Abstract_Fin_Dataset):
 
     def __init__(self,
-                 data_dir: str | Path = os.path.join('..', 'data', 'news_data'),
+                 data_dir: str | Path = os.path.join('..', 'data'),
                  batch_size: int = 32,
                  slice_size: int = 10_000,
                  unified_filenm: str = 'all_data.csv',
