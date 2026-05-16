@@ -277,7 +277,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                 
                 #(batch_size, 1)
                 sentiment_scores = mdl.forward(
-                                df['text'].fillna('nothing').tolist()
+                                df['text'].astype(str).fillna('nothing').tolist()
                                 )
 
                 df['sentiment'] = sentiment_scores.cpu().numpy()
@@ -1511,7 +1511,11 @@ if __name__ == '__main__':
 
 
     batch_size = 32
-    data = DataLoader(Joint_Dataset(), batch_size=32, shuffle=True)
+    data = DataLoader(Joint_Dataset(lookback=seq_len,
+                                    horizon=prediction_length),
+                      batch_size=32,
+                      shuffle=True
+                      )
 
     num_epochs = 10
 
