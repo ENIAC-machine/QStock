@@ -528,7 +528,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
         real_idx = self.lookback + idx
 
         #reshaped to (batch, 1)
-        sentiment = torch.Tensor(list(self.df.loc[real_idx, 'sentiment']).to_numpy().\
+        sentiment = torch.Tensor([list([self.df.loc[real_idx, 'sentiment'])].to_numpy().\
                                                                             reshape(-1, 1).\
                                                                             astype(float)
                                  )
