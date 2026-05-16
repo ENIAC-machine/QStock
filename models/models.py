@@ -72,6 +72,10 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         
         if not load_from_file:
             self.load()
+        else:
+            self.num_elements = sum(len(chunk) for chunk in pd.read_csv(self.unified_filepath, chunksize=10_000))
+            self.columns = next(pd.read_csv(self.unified_filepath, chunksize=1)).columns
+            self.shape = (self.num_elements, len(self.columns))
 
     def get_init_args(self, local_vars: dict) -> dict:
         kwargs = local_vars.copy()
@@ -100,15 +104,436 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         '''
     
         ...
+        return None
+
+    #TODO: rewrite to polars
+    def __add__(self,
+                other
+                ) -> pd.DataFrame:
+        
+        df_mine = pd.read_csv(self.unified_filenm)
+        df_other = pd.read_csv(other.unified_filenm)
+        
+        df_res = df_mine.merge(df_other, on='date', how='left')
+
+        return df_res
+
 
     def __len__(self) -> int:
         return self.num_elements
 
     def __getitem__(self, idx: int) -> list[Any]:
-        return pd.read_csv(self.unified_filenm,
-                           skiprows=idx,
-                           nrows=1
-                           ).iloc[0, :].to_list()
+        return torch.Tensor(pd.read_csv(self.unified_filepath,
+                                        skiprows=idx,
+                                        nrows=1
+                                        ).iloc[0, 2:].to_numpy().astype(float)
+                            )
+
+class Joint_Dataset(Abstract_Fin_Dataset):
+
+    def __init__(self,
+                 data_dir: str | Path = os.path.join('..', 'data'),
+                 batch_size: int = 32,
+                 slice_size: int = 10_000,
+                 unified_filenm: str = 'all_data.csv',
+                 load_from_file: bool = False,
+                 delete_old: bool = True,
+                 lookback: int = 10,
+                 horizon: int = 10
+                 ) -> None:
+
+        self.slice_size = slice_size
+        local_vars = locals()
+        local_vars.pop('slice_size')
+
+        #self.get_init_args(local_vars)
+        super().__init__(**self.get_init_args(local_vars))
+    
+        #fills during the .to_sentiment method
+        self.sentiment_filepath: str = None
+
+        return None
+
+    def _prepare_data(self,
+                      load_func: Callable,
+                      data_path: str | Path | None = None,
+                      verbose: bool = True
+                      ):# -> Generator[pd.DataFrame | None]:
+
+        '''
+        Function to prepare data of a single file (archive of csv) into a pd.DataFrame object
+
+        Inputs:
+            data_path: str | Path - path to the file
+            load_func: Callable - function to load it with
+            slice_size: int = 10_000 - size of a chunk to process at a time
+            verbose: bool = True - verbosity flag
+
+        Outputs:
+            pd.DataFrame - chunk of the file
+
+        '''
+
+        end = data_path.split('.')[-1]
+        #print(end)
+
+        #print(f'data_path={data_path}')
+        try:
+            match end:
+
+                case 'csv':
+
+                    reader = load_func(data_path, chunksize=self.slice_size)
+                    for df in tqdm(reader,
+                                   desc='Loading DataFrame chunks',
+                                   leave=False,
+                                   disable=not verbose,
+                                   unit=' chunks'):
+                        self.num_elements += df.shape[0]
+                        yield df
+
+
+                case 'gz' | 'bz2' | 'sql':
+
+                    #make the object an iterable for the `islice` function to work
+                    gen = iter(load_func(data_path))
+                    
+                    lines_cnt = 0
+                    with tqdm(unit=' lines', leave=False, disable=not verbose) as progress:
+                        while True: #because we don't know the num of elements in the generator
+                            data = list(islice(gen, self.slice_size))
+                            
+                            if data is None or len(data) == 0:
+                                break
+
+                            print(data[-1].__attributes__)
+
+                            columns = ['date', 'text']
+                             
+                            df = pd.DataFrame(data, columns=data[-1].__attributes__)
+                            
+                            if 'timestamp' in df.columns:
+                                df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
+                                                                                   x.date()
+                                                                                   )
+                                print('!')
+
+
+                            if pd.unique(df['date'])[0] == None:
+
+                                #attempt to reconstruct date from url, drop values that can't be converted 
+                                df['date'] = pd.to_datetime(
+                                                df['url'].apply(lambda x:'/'.join(
+                                                    x.split('news/')[-1].split('/')[:3])
+                                                                ),
+                                                errors='coerce'
+                                                ).dropna(how='any',
+                                                axis=0
+                                                ).reset_index(drop=True).apply(lambda x:x.date())
+                            df = df[columns]
+                        
+                            yield df 
+                            
+                            lines_cnt += df.shape[0]
+                            self.num_elements += df.shape[0]
+                            progress.update(self.slice_size) 
+
+                case _:
+                    if verbose:
+                        print(f'Unknown datatype to process: {data_path.split(".")}')
+                    yield None
+
+        except:
+            if verbose:
+                print(f'Load failed for file {data_path} with loading function {load_func}')
+            yield None
+
+    def to_sentiment(self,
+                     new_filepath: str | None = None,
+                     mdl_cfg: dict | Any | None = None,
+                     batch_size: int = 100,
+                     verbose: bool = True
+                     )->None:
+        
+        if new_filepath is None:
+            new_filepath = Path(self.unified_filepath).with_name('all_data_sentiment.csv')
+        
+        self.sentiment_filepath = new_filepath
+
+        mdl = Sentiment_Model(cfg=mdl_cfg)
+        mdl.eval()
+
+        reader = pd.read_csv(self.unified_filepath, chunksize=batch_size) 
+        pd.DataFrame(columns=['date', 'sentiment']).to_csv(new_filepath, header=True)
+        
+        with torch.no_grad():
+       
+            for df in tqdm(reader,
+                           desc='Converting text to sentiment',
+                           total=int(np.ceil(self.num_elements / batch_size)),
+                           leave=False,
+                           disable=not verbose,
+                           unit=' batches'):
+                
+                #(batch_size, 1)
+                sentiment_scores = mdl.forward(
+                                df['text'].fillna('nothing').tolist()
+                                )
+
+                df['sentiment'] = sentiment_scores.cpu().numpy()
+                
+                df.to_csv(new_filepath,
+                          header=False,
+                          mode='a',
+                          columns=['date', 'sentiment']
+                          )
+            return None
+
+    #TODO: make the case for low memory, or just rewrite to polars
+    def agg(self,
+            agg_func: str | Callable = 'mean',
+            verbose: bool = False
+            ) -> pd.DataFrame:
+        ''' 
+        Aggregates the data for the sentiment
+        '''
+
+        #here I reset and drop 'index' cause the index col may be 'date' or smth
+        df = pd.read_csv(self.sentiment_filepath).reset_index(drop=False).drop(columns='index')
+
+        #just in case there will be unnamed cols due to indices and stuff
+        df.drop(columns=[col for col in df.columns if 'Unnamed' in col])
+
+        agg_sentiment_path = Path(self.sentiment_filepath).with_name('agg_sentiment.csv')
+        if verbose:
+            print('Aggregating data...')
+        df_new = df.groupby(by='date').mean()
+        if verbose:
+            print('Data aggregated, converting into .csv format...')
+
+        df_new.to_csv(agg_sentiment_path)
+
+        #reset the path to fetch data
+        self.unified_filenm =  agg_sentiment_path
+        self.num_elements = len(df_new)
+        return df_new
+
+
+    def load(self,
+             sentiment_cfg: dict = {
+                 "model_name": "ProsusAI/finbert",
+                 "num_labels": 3,                  
+                 "device": "cuda" if torch.cuda.is_available() else 'cpu',
+                 "score" : True
+                 },
+             sentiment_batch_size: int = 100,
+             st: str = '2014-01-01',
+             end: str = '2026-01-01',
+             tickers: list[str] | tuple[str] = ['GAZP', 'YNDX', 'NVTK', 'SBER', 'VTBR', 'LKOH',
+                                                'GMKN', 'NLMK', 'MGNT', 'AFKS', 'AFLT', 'MTSS',
+                                                'HYDR', 'FEES', 'ALRS', 'PLZL', 'CHMF', 'MAGN',
+                                                'MOEX', 'TATN', 'SNGS'], 
+             verbose: bool = True
+             ) -> None:
+
+        '''
+        Opens archives and saves their contents in a single file
+
+        Inputs:
+            self.data_dir:str | Path = NEWS_DATA_DIR - inputs in the format (function_to_process_file, file_names)
+            self.slice_size: int = 10_000 - size of a chunk DataFrame to load from each archive
+            self.delete_old: bool = True - flag to delete the old file
+            self.unified_filepath: str = 'all_data.csv' - name of the new unified file
+            verbose: bool = True - verbosity flag
+
+        Outputs:
+            None
+
+        '''
+
+        if os.path.exists(self.unified_filepath) and self.delete_old:
+            if verbose:
+                print('Found file with the same name in the data directory, deleting...')
+            os.remove(self.unified_filepath)
+        
+
+        pd.DataFrame(columns=['date', 'text']).to_csv(self.unified_filepath,
+                                                      header=True)
+        if os.path.exists('checkpoint.pkl'):
+            with open('checkpoint.pkl', 'rb') as file:
+                checkpoint: dict[str, int] = pickle.load(file)
+        else:
+            checkpoint = {'load_func' : 0,
+                          'data_path' : 0,
+                          'df' : 0,
+                          'dt' : 0
+                          }
+
+        def save_checkpoint() -> None:
+            with open('checkpoint.pkl', 'wb') as file:
+                pickle.dump(checkpoint, file)
+            return None
+
+        total_nans = 0
+
+        for load_func, data_paths in tqdm(func_to_data.items(),
+                                          desc='Loading data',
+                                          unit=' file batches',
+                                          colour='green',
+                                          disable=not verbose):
+
+            #print(data_paths)
+            if self.unified_filenm in data_paths:
+                data_paths.remove(self.unified_filenm)
+
+            for idx, filenm in tqdm(enumerate(data_paths),
+                                    desc='Adding paths',
+                                    leave=False,
+                                    disable=not verbose):
+
+                data_paths[idx] = os.path.join(self.data_dir, filenm) #integrate full path with filename
+           
+            if len(data_paths):
+                data_path = data_paths[0]
+            else:
+                continue
+
+
+            for data_path in tqdm(data_paths,
+                                  desc=f'Loading archive {data_path}',
+                                  leave=False,
+                                  unit=" files",
+                                  disable=not verbose,
+                                  initial=checkpoint['data_path']):
+
+                for df in tqdm(self._prepare_data(data_path = data_path,
+                                                  load_func=load_func,
+                                                  verbose=verbose),
+                               unit= " batches",
+                               leave=False,
+                               disable=not verbose#,
+                               #initial=checkpoint['df']
+                               ):
+
+                    if df is None:
+                        continue
+
+                    print(df.head())
+
+                    total_nans += len(df[df["date"].isna()])
+                    
+                    df = df.dropna(subset='date')
+                    '''
+                    print(f'{data_path}\n\n{df}')
+                    ans = input('break?')
+
+                    if ans == 'yes':
+                        break
+                    '''
+
+                    df.to_csv(self.unified_filepath,
+                             header=False,
+                              mode='a',
+                              columns=['date', 'text']
+                              )
+                else:
+                    continue
+                break
+
+            else:
+                continue
+            break
+
+        print(f'Total nans found: {total_nans}')
+        
+        self.to_sentiment(batch_size=sentiment_batch_size, mdl_cfg=sentiment_cfg)
+        df_sentiment: pd.DataFrame = self.agg(verbose=True)
+
+        if verbose:
+            print('Finished loading sentiment data, starting to load the stock data...')
+
+        tickers = tickers[:2]
+
+        df = history(list(tickers),
+             st=st,
+             end=end,
+             max_retries=20,
+             retry_pause=10,
+             verbose=True)
+
+        def func(sub_df):
+            sub_df = sub_df.T.droplevel(axis=1, level=0)
+            sub_df = sub_df[['TRADEDATE', 'OPEN', 'CLOSE', 'HIGH', 'LOW']]
+            sub_df.dropna(axis=0, inplace=True)
+            return sub_df
+        
+        cols_to_save = ['TRADEDATE', 'OPEN', 'CLOSE', 'HIGH', 'LOW']
+        df = df.loc[:, pd.IndexSlice[:, cols_to_save]]
+        df.columns = df.columns.map('_'.join)
+
+        date_cols = [col  for col in df.columns if col.endswith('TRADEDATE')]
+
+        df_new = pd.DataFrame({'TRADEDATE' : pd.bdate_range(start=st,
+                                                            end=end)
+                               }
+                              )
+        for col in date_cols:
+            df[col] = pd.to_datetime(df[col])
+            stock_cols = [column for column in df.columns
+                          if column.startswith( col.split('_')[0] )
+                          ]
+            df_new = df_new.merge(df[stock_cols],
+                                  how='left',
+                                  left_on='TRADEDATE',
+                                  right_on=col
+                                  ).drop(columns=[col])
+
+        df_stock = df_new.dropna(axis=0, how='any').reset_index(drop=True)
+        print(df_new.shape)
+        print(df_new.head())
+        self.num_elements = len(df)
+        df_stock.to_csv(self.unified_filenm)
+        self.columns = df_stock.columns.to_list()
+        self.num_elements = len(range(len(df_stock) - self.lookback - self.horizon + 1))
+        self.shape: tuple = (self.num_elements, df_stock.shape[1])
+        
+        df_res = df_sentiment.merge(df_stock,
+                                    left_on='date', right_on='TRADEDATE',
+                                    how='inner').drop(columns='date')
+    
+
+        self.shape = df_res.shape
+        self.num_elements = df_res.shape[0] - self.lookback - self.horizon + 1
+        self.df = df_res
+        df_res.to_csv(self.unified_filepath.with_name('preprocessed_data.csv'),
+                      index=False)
+        return df_res
+
+
+    def __getitem__(self,
+                    idx: int
+                    ) -> (torch.Tensor, torch.Tensor, torch.Tensor):
+        
+        real_idx = self.lookback + idx
+
+        #reshaped to (batch, 1)
+        sentiment = torch.Tensor(list(self.df.loc[real_idx, 'sentiment']).to_numpy().\
+                                                                            reshape(-1, 1).\
+                                                                            astype(float)
+                                 )
+
+        x = self.df.iloc[real_idx - self.lookback: real_idx, :].drop(columns=['TRADEDATE',
+                                                                                'sentiment']
+                                                                       ).to_numpy().astype(float)
+
+        y = self.df.iloc[real_idx: real_idx + self.horizon, :].drop(columns=['TRADEDATE',
+                                                                              'sentiment']
+                                                                     ).to_numpy().astype(float)
+
+        
+        x, y = torch.Tensor(x),torch.Tensor(y)
+
+        return sentiment, x, y
 
 class News_Dataset(Abstract_Fin_Dataset):
 
@@ -125,7 +550,7 @@ class News_Dataset(Abstract_Fin_Dataset):
         local_vars = locals()
         local_vars.pop('slice_size')
 
-        self.get_init_args(local_vars)
+        #self.get_init_args(local_vars)
         super().__init__(**self.get_init_args(local_vars))
     
         #fills during the .to_sentiment method
@@ -407,7 +832,8 @@ class News_Dataset(Abstract_Fin_Dataset):
         df_new.to_csv(agg_sentiment_path)
 
         #reset the path to fetch data
-        self.unified_filenm =  agg_sentiment_path   
+        self.unified_filenm =  agg_sentiment_path
+        self.num_elements = len(df_new)
         return df_new
         
 class Time_Series_Dataset(Abstract_Fin_Dataset):
@@ -417,7 +843,7 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
                  batch_size: int = 32,
                  lookback: int = 10,
                  horizon: int = 10,
-                 unified_filenm: str = os.path.join('..', 'data', 'stock_data', 'stock_data.csv'),
+                 unified_filenm: str = 'stock_data.csv',
                  load_from_file: bool = True,
                  delete_old: bool = True,
                  ) -> None:
@@ -487,6 +913,7 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         print(df_new.head())
         self.num_elements = len(df)
         df_new.to_csv(self.unified_filenm)
+        self.columns = df_new.columns.to_list()
         self.num_elements = len(range(len(df_new) - self.lookback - self.horizon + 1))
         self.shape: tuple = (self.num_elements, df_new.shape[1])
         return None
@@ -496,22 +923,22 @@ class Time_Series_Dataset(Abstract_Fin_Dataset):
         x = pd.read_csv(self.unified_filenm,
                         skiprows=min(0, idx-self.lookback),
                         nrows=self.lookback,
-                        index_col=0,
-                        usecols=list(range(self.shape[1]))#[(0 if dates else 1):]
-                        )
+                        index_col=0
+                        ).iloc[:, 0 if dates else 1:]
 
         y = pd.read_csv(self.unified_filenm,
                         skiprows=min(0, idx),
                         nrows=self.horizon,
-                        usecols=list(range(self.shape[1]))[0 if dates else 1:]
-                        )
+                        index_col=0
+                        ).iloc[:, 0 if dates else 1:]
 
         if dates:
             return x, y
         
         else:
-            x, y = torch.Tensor(x.to_numpy()[:, int(not dates):].astype(float)),\
-                    torch.Tensor(y.to_numpy()[:, int(not dates):].astype(float))
+            print(x)
+            x, y = torch.Tensor(x.to_numpy().astype(float)),\
+                    torch.Tensor(y.to_numpy().astype(float))
 
             return x, y
 
@@ -857,6 +1284,7 @@ class TS_JOPA(nn.Module):
         super().__init__()
 
         self.batch_size = batch_size
+        self.prediction_length = time_series_config.prediction_length
         
         if hasattr(time_series_config, 'hidden_dim'):
             self.hidden_dim = time_series_config['hidden_dim']
@@ -897,15 +1325,18 @@ class TS_JOPA(nn.Module):
 
         #self.quantum_model.mapping holds a mapping from the names of the layers to their pennylane classes
         num_params_quantum_layer = self.quantum_model.mapping[self.quantum_model.layer_type].\
-                                                                        shape(n_wires=self.n_qubits,
-                                                                              n_layers=1)
+                shape(n_wires=self.n_qubits,
+                      n_layers=1
+                      )
+
         #post-quantum algorithm projection
         self.post_q_proj = nn.Linear(1 << self.n_qubits,
                                      self.time_series_proj_dim
                                      )
 
-        self.out_proj = nn.Linear(self.time_series_proj_dim, time_series_config.prediction_length)
-
+        self.out_proj = nn.Linear(self.time_series_proj_dim,
+                                  time_series_config.prediction_length * num_features
+                                  )
 
     def forward(self,
                 time_series_inputs: Annotated[torch.Tensor,
@@ -938,7 +1369,7 @@ class TS_JOPA(nn.Module):
         ts_out_agg = ts_out.mean(dim=(1,2))
         #print(f'Time-series embeds: {ts_out_agg.shape}')
 
-        combined = torch.cat([ts_out_agg, sentiment], dim=1)
+        combined = ts_out_agg * sentiment
         
         if ts_out_agg.shape[1] < self.quantum_dim:
             pad = torch.zeros(self.batch_size,
@@ -946,7 +1377,11 @@ class TS_JOPA(nn.Module):
                               device=combined.device
                               )
 
-            combined = torch.cat([combined, pad], dim=1)
+            combined = F.pad(combined,
+                             pad=(0, self.quantum_dim - combined.shape[1]),
+                             mode='constant',
+                             value=0)
+            #combined = torch.cat([combined, pad], dim=1)
         
         q_outs = [] #quantum_registers' outputs
         for idr, register in enumerate(range(0,
@@ -969,11 +1404,11 @@ class TS_JOPA(nn.Module):
 
         q_outs = torch.cat(q_outs, dim=1).float()
         print(f'q_outs: {q_outs.shape}') #(batch, )
-        print(q_outs.dtype)
+        #print(q_outs.dtype)
 
         post_q_outs = self.post_q_proj(q_outs)
         print(f'post_q_outs: {post_q_outs.shape}')
-        out = self.out_proj(post_q_outs)
+        out = self.out_proj(post_q_outs).view(-1, self.prediction_length, num_features) # (batch, 10, 8)
         print(f'out: {out.shape}')
         return out
 
@@ -982,7 +1417,7 @@ if __name__ == '__main__':
     # ----------  Model parameters ----------
     batch_size = 4
     seq_len = 10               # time series sequence length
-    num_features = 5
+    num_features = 4*2 #channels per stock \times num_stocks
     prediction_length = 10
     d_model = 8                # hidden dimension for PatchTST
 
@@ -1054,24 +1489,29 @@ if __name__ == '__main__':
     # ---------- Prepare data ----------
 
     
-    path_news_data = os.path.join('..', 'data', 'news_data')
-    news_data = News_Dataset(path_news_data,
-                             load_from_file=False,
-                             delete_old=True)
+    #path_news_data = os.path.join('..', 'data', 'news_data')
+    #news_data = News_Dataset(path_news_data,
+    #                         unified_filenm='finished_data_sentiment.csv',
+    #                         load_from_file=True,
+    #                         delete_old=False)
 
-    news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
-    news_data.agg(verbose= True)
-    news_dataloader = DataLoader(news_data, batch_size=32)
+    #news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
+    #news_data.agg(verbose= True)
+    #news_dataloader = DataLoader(news_data, batch_size=32)
     
-    time_series_inputs = Time_Series_Dataset(lookback=seq_len,
-                                             horizon=prediction_length,
-                                             load_from_file=False,
-                                             delete_old=True)
+    #time_series_inputs = Time_Series_Dataset(lookback=seq_len,
+    #                                         horizon=prediction_length,
+    #                                         load_from_file=False,
+    #                                         delete_old=True)
 
-    time_series_batch_size = 16
-    time_series_dataloader = DataLoader(time_series_inputs,
-                                        batch_size=time_series_batch_size,
-                                        shuffle=False)
+    #time_series_batch_size = 32
+    #time_series_dataloader = DataLoader(time_series_inputs,
+    #                                    batch_size=time_series_batch_size,
+    #                                    shuffle=False)
+
+
+    batch_size = 32
+    data = DataLoader(Joint_Dataset(), batch_size=32, shuffle=True)
 
     num_epochs = 10
 
@@ -1080,15 +1520,12 @@ if __name__ == '__main__':
     for epoch in range(num_epochs):
 
         #TODO: fix later
-        for news_inputs, (time_series_inputs, targets) in zip(news_dataloader,
-                                                            time_series_dataloader
-                                                            ):
+        for sentiment, inputs, targets in data:
 
-            print(f'{time_series_inputs}\n\n\n{targets}')
 
-            output = combined_model(time_series_inputs, news_inputs)
+            output = combined_model(inputs, sentiment)
             print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
-
+            print(f'Target shape: {targets.shape}')
             loss = nn.MSELoss()(output, targets)
             loss.backward()
             print("Backward pass completed. Gradients exist:", any(
