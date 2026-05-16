@@ -1524,7 +1524,7 @@ if __name__ == '__main__':
     data = DataLoader(Joint_Dataset(lookback=seq_len,
                                     horizon=prediction_length,
                                     load_from_file=True,
-                                    unified_filename='preprocessed_data.csv'
+                                    unified_filnm='preprocessed_data.csv'
                                     ),
                       batch_size=32,
                       shuffle=True
