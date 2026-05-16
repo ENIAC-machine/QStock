@@ -534,7 +534,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
 
         x = self.df.iloc[real_idx - self.lookback: real_idx, :].drop(columns=['TRADEDATE',
                                                                                 'sentiment']
-                                                                       ).to_numpy().astype(float)
+                                                                                                              ).to_numpy().astype(float)
 
         y = self.df.iloc[real_idx: real_idx + self.horizon, :].drop(columns=['TRADEDATE',
                                                                               'sentiment']
@@ -1522,7 +1522,10 @@ if __name__ == '__main__':
 
     batch_size = 32
     data = DataLoader(Joint_Dataset(lookback=seq_len,
-                                    horizon=prediction_length),
+                                    horizon=prediction_length,
+                                    load_from_file=True,
+                                    unified_filename='preprocessed_data.csv'
+                                    ),
                       batch_size=32,
                       shuffle=True
                       )
