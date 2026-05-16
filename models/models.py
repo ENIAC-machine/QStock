@@ -39,7 +39,7 @@ NEWS_DATA_DIR = os.path.join('..', 'data')
 
 #global variable to map preprocessing functions to the files
 func_to_data = {load_lenta: ['lenta-ru-news.csv.gz'],
-                load_lenta2 : ['lenta-ru-news.csv.bz2'],
+                load_lenta2 : ['lesnta-ru-news.cv.bz2'],
                 load_mokoron : ['db.sql'],
                 load_buriy_news : ['news-articles-2014.tar.bz2',
                                    'news-articles-2015-part1.tar.bz2',
@@ -113,7 +113,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         
         df_mine = pd.read_csv(self.unified_filenm)
         df_other = pd.read_csv(other.unified_filenm)
-        
+
         df_res = df_mine.merge(df_other, on='date', how='left')
 
         return df_res
@@ -496,7 +496,10 @@ class Joint_Dataset(Abstract_Fin_Dataset):
         self.columns = df_stock.columns.to_list()
         self.num_elements = len(range(len(df_stock) - self.lookback - self.horizon + 1))
         self.shape: tuple = (self.num_elements, df_stock.shape[1])
-        
+       
+        df_sentiment['date'] = pd.to_datetime(df_sentiment['date'])
+        df_stock['TRADEDATE'] = pd.to_datetime(df_stock['TRADEDATE'])
+
         df_res = df_sentiment.merge(df_stock,
                                     left_on='date', right_on='TRADEDATE',
                                     how='inner').drop(columns='date')
