@@ -80,6 +80,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         if not load_from_file:
             self.load()
         else:
+            self.df = pd.read_csv(self.unified_filepath)
             self.num_elements = sum(len(chunk) for chunk in pd.read_csv(self.unified_filepath, chunksize=10_000)) - lookback - horizon + 1
             self.columns = next(pd.read_csv(self.unified_filepath, chunksize=1)).columns
             self.shape = (self.num_elements, len(self.columns))
