@@ -59,9 +59,16 @@ class Abstract_Fin_Dataset(Dataset, ABC):
                  unified_filenm: str = 'all_data.csv',
                  load_from_file: bool = False,
                  delete_old: bool = True,
+                 lookback: int = None,
+                 horizon: int = None
                  ) -> None:
 
         super().__init__()
+
+        if lookback is None:
+            lookback = 0
+        if horizon is None:
+            horizon = 0
 
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -73,7 +80,7 @@ class Abstract_Fin_Dataset(Dataset, ABC):
         if not load_from_file:
             self.load()
         else:
-            self.num_elements = sum(len(chunk) for chunk in pd.read_csv(self.unified_filepath, chunksize=10_000))
+            self.num_elements = sum(len(chunk) for chunk in pd.read_csv(self.unified_filepath, chunksize=10_000)) - lookback - horizon + 1
             self.columns = next(pd.read_csv(self.unified_filepath, chunksize=1)).columns
             self.shape = (self.num_elements, len(self.columns))
 
@@ -307,11 +314,11 @@ class Joint_Dataset(Abstract_Fin_Dataset):
         agg_sentiment_path = Path(self.sentiment_filepath).with_name('agg_sentiment.csv')
         if verbose:
             print('Aggregating data...')
-        df_new = df.groupby(by='date').mean()
+        df_new = df.groupby(by='date').mean().reset_index()
         if verbose:
             print('Data aggregated, converting into .csv format...')
 
-        df_new.to_csv(agg_sentiment_path)
+        df_new.to_csv(agg_sentiment_path, index=False)
 
         #reset the path to fetch data
         self.unified_filenm =  agg_sentiment_path
