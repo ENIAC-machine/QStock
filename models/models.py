@@ -1491,7 +1491,7 @@ if __name__ == '__main__':
         quantum_depth=quantum_depth,
         dim_post_quantum=dim_post_quantum,
         max_quantum_register_size=max_quantum_register_size
-    )
+    ).to(device)
 
     sentiment_cfg = {
             "model_name": "ProsusAI/finbert",
