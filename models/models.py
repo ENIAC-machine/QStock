@@ -1139,7 +1139,7 @@ if __name__ == '__main__':
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     optimizer = torch.optim.Adam(combined_model.parameters(),
-                                 lr=1e-3
+                                 lr=1e-2
                                  )
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
