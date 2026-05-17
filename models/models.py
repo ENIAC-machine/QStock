@@ -527,8 +527,10 @@ class Joint_Dataset(Abstract_Fin_Dataset):
         
         real_idx = self.lookback + idx
 
+        #print(self.df)
+
         #reshaped to (batch, 1)
-        sentiment = torch.Tensor([list(self.df.loc[real_idx, 'sentiment'])].to_numpy().\
+        sentiment = torch.Tensor(np.array([self.df.loc[real_idx, 'sentiment']]).\
                                                                             reshape(-1, 1).\
                                                                             astype(float)
                                  )
@@ -1376,28 +1378,32 @@ class TS_JOPA(nn.Module):
                                        ] - sentiment values
         '''
         
+        sentiment = sentiment.reshape(-1, 1)
+
         ts_out = self.time_series_model(time_series_inputs).hidden_states[self.hidden_dim] #(batch, n_patches, embed_size, d_model)
         ts_out_agg = ts_out.mean(dim=(1,2))
         #print(f'Time-series embeds: {ts_out_agg.shape}')
+        #print(sentiment.shape)
 
-        combined = ts_out_agg * sentiment
+        combined = (ts_out_agg * sentiment)
         
-        if ts_out_agg.shape[1] < self.quantum_dim:
-            pad = torch.zeros(self.batch_size,
-                              self.quantum_dim - combined.shape[1],
-                              device=combined.device
-                              )
+        #print(combined.shape)
+
+        if combined.shape[1] < self.quantum_dim:
 
             combined = F.pad(combined,
                              pad=(0, self.quantum_dim - combined.shape[1]),
                              mode='constant',
                              value=0)
-            #combined = torch.cat([combined, pad], dim=1)
+        
+        #print(combined.shape)
         
         q_outs = [] #quantum_registers' outputs
-        for idr, register in enumerate(range(0,
-                                             self.num_registers,
-                                             self.quantum_stride)
+        for idr, register in enumerate(
+                                        range(0,
+                                              self.num_registers,
+                                              self.quantum_stride
+                                              )
                                        ):
             to_encode = combined[:,
                                  idr : min(combined.shape[1],
@@ -1411,24 +1417,28 @@ class TS_JOPA(nn.Module):
                                     dim=1
                                     )*2*np.pi #normalize to [0, 2pi] to encode
             
+            #print(to_encode.shape)
             q_outs.append(self.quantum_model.forward(to_encode)*magnitudes)
 
         q_outs = torch.cat(q_outs, dim=1).float()
-        print(f'q_outs: {q_outs.shape}') #(batch, )
+        #print(f'q_outs: {q_outs.shape}') #(batch, )
         #print(q_outs.dtype)
 
         post_q_outs = self.post_q_proj(q_outs)
-        print(f'post_q_outs: {post_q_outs.shape}')
+        #print(f'post_q_outs: {post_q_outs.shape}')
         out = self.out_proj(post_q_outs).view(-1, self.prediction_length, num_features) # (batch, 10, 8)
-        print(f'out: {out.shape}')
+        #print(f'out: {out.shape}')
         return out
 
 
 if __name__ == '__main__':
-    # ----------  Model parameters ----------
-    batch_size = 4
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    train_pct = .8
+    num_epochs = 100
+    batch_size = 32
     seq_len = 10               # time series sequence length
-    num_features = 4*2 #channels per stock \times num_stocks
+    num_features = 4*21 #channels per stock \times num_stocks
     prediction_length = 10
     d_model = 8                # hidden dimension for PatchTST
 
@@ -1453,7 +1463,7 @@ if __name__ == '__main__':
 
     quantum_model_config = {
         'layer_type' : 'StronglyEntanglingLayers',
-        'n_layers' : 2,
+        'n_layers' : 10,
         'wires': range(4),
         'layer_config': None,
         'encoder': Quantum_Encoder,
@@ -1471,7 +1481,6 @@ if __name__ == '__main__':
 
     
 
-    # ---------- Instantiate the combined model ----------
     combined_model = TS_JOPA(
         time_series_model=PatchTSTForPrediction,
         time_series_config=time_series_config,
@@ -1491,68 +1500,117 @@ if __name__ == '__main__':
             "score" : True
             }
 
-    #sentiment_model = Sentiment_Model(cfg=sentiment_cfg)
 
-    #JOPA = TS_JOPA(combined_model, sentiment_model)
+    full_dataset = Joint_Dataset(lookback=seq_len,
+                                 horizon=prediction_length,
+                                 load_from_file=True,
+                                 unified_filenm='preprocessed_data.csv') 
 
-    #print("Combined model instantiated successfully.")
+    train_size = int(train_pct * len(full_dataset))
+    test_size = len(full_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, test_size]
+    )
 
-    # ---------- Prepare data ----------
-
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    #path_news_data = os.path.join('..', 'data', 'news_data')
-    #news_data = News_Dataset(path_news_data,
-    #                         unified_filenm='finished_data_sentiment.csv',
-    #                         load_from_file=True,
-    #                         delete_old=False)
-
-    #news_data.to_sentiment(batch_size=100, mdl_cfg=sentiment_cfg)
-    #news_data.agg(verbose= True)
-    #news_dataloader = DataLoader(news_data, batch_size=32)
+    optimizer = torch.optim.Adam(combined_model.parameters(),
+                                 lr=1e-3
+                                 )
     
-    #time_series_inputs = Time_Series_Dataset(lookback=seq_len,
-    #                                         horizon=prediction_length,
-    #                                         load_from_file=False,
-    #                                         delete_old=True)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+                                                           mode='min',
+                                                           patience=3,
+                                                           factor=0.5
+                                                           )
+    criterion = nn.MSELoss()
 
-    #time_series_batch_size = 32
-    #time_series_dataloader = DataLoader(time_series_inputs,
-    #                                    batch_size=time_series_batch_size,
-    #                                    shuffle=False)
+    best_test_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = 5
 
-
-    batch_size = 32
-    data = DataLoader(Joint_Dataset(lookback=seq_len,
-                                    horizon=prediction_length,
-                                    load_from_file=True,
-                                    unified_filenm='preprocessed_data.csv'
-                                    ),
-                      batch_size=32,
-                      shuffle=True
-                      )
-
-    num_epochs = 10
-
-
-    #TODO: finish the data pipeline to have a unified dataset to load from. Preprocess news into sentiment values for each date
     for epoch in range(num_epochs):
 
-        #TODO: fix later
-        for sentiment, inputs, targets in data:
+        combined_model.train()
+        train_loss = 0.0
+        train_loop = tqdm(train_loader,
+                          desc=f'Epoch {epoch+1}/{num_epochs} [Train]',
+                          leave=False
+                          )
 
 
-            output = combined_model(inputs, sentiment)
-            print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
-            print(f'Target shape: {targets.shape}')
-            loss = nn.MSELoss()(output, targets)
+        for sentiment, inputs, targets in train_loader:
+
+            sentiment, inputs, targets = sentiment.to(device),\
+                                            inputs.to(device),\
+                                            targets.to(device)
+
+    
+            optimizer.zero_grad()
+            outputs = combined_model(inputs, sentiment)
+            #print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
+            #print(f'Target shape: {targets.shape}')
+            loss = criterion(outputs, targets)
             loss.backward()
-            print("Backward pass completed. Gradients exist:", any(
-                p.grad is not None for p in combined_model.parameters()
-            ))
+            #print("Backward pass completed. Gradients exist:", any(
+            #    p.grad is not None for p in combined_model.parameters()
+            #))
 
-            break
-        
+            #gradient clipping 
+            #torch.nn.utils.clip_grad_norm_(combined_model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            train_loss += loss.item() * inputs.size(0)
+            train_loop.set_postfix(loss=loss.item())
+
+            #break
+
         else:
-            continue
+            avg_train_loss = train_loss / len(train_loader.dataset)
         
+            #check on test
+            combined_model.eval()
+            test_loss = 0.0
+            with torch.no_grad():
+                test_loop = tqdm(test_loader,
+                                 desc=f'Epoch {epoch+1}/{num_epochs} [Test]',
+                                 leave=False)
+
+                for sentiment, inputs, targets in test_loop:
+                    sentiment, inputs, targets = sentiment.to(device), inputs.to(device), targets.to(device)
+                    outputs = combined_model(inputs, sentiment)
+                    loss = criterion(outputs, targets)
+                    test_loss += loss.item() * inputs.size(0)
+                    test_loop.set_postfix(loss=loss.item())
+            
+            avg_test_loss = test_loss / len(test_loader.dataset)
+            scheduler.step(avg_test_loss)
+            
+            print(f'Epoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, Test Loss = {avg_test_loss:.6f}')
+            
+
+            if (epoch + 1) % 5 == 0:
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'model_state_dict': combined_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_test_loss,
+                }
+                torch.save(checkpoint, f"checkpoint_epoch_{epoch+1}.pth")
+
+            # early stopping
+            if avg_test_loss < best_test_loss:
+                best_test_loss = avg_test_loss
+                torch.save(combined_model.state_dict(), 'best_model.pth')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stop_patience:
+                    print("Early stopping triggered.")
+                    break
+
+            continue
         break
+
+    print("Training complete. Best test loss:", best_test_loss)
