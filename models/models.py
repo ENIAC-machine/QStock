@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pennylane as qml
 
-from itertools import islice
+from itertools import combinations, islice
 from corus import load_lenta, load_lenta2, load_mokoron, load_buriy_news, load_buriy_webhose
 from torch.utils.data import DataLoader, ConcatDataset, Dataset, Subset, TensorDataset
 
@@ -26,18 +26,28 @@ from transformers import (
         PatchTSTConfig, PatchTSTForPrediction
         )
 
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.feature_selection import mutual_info_regression
 
 from tqdm import tqdm
 
 from moex_api.history import history, trading_listing
 
 from pathlib import Path
-from typing import Callable, Generator, Any, Iterable, Sequence, Annotated, Literal
+from typing import Callable, Generator, Any, Iterable, Sequence, Annotated, Literal, Optional
 from abc import abstractmethod, ABC
+
+seed = 42
+
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)      # if using multi-GPU
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 NEWS_DATA_DIR = os.path.join('..', 'data')
 
@@ -228,7 +238,6 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                                 df['date'] = pd.to_datetime(df['timestamp']).apply(lambda x:
                                                                                    x.date()
                                                                                    )
-                                print('!')
 
 
                             if pd.unique(df['date'])[0] == None:
@@ -339,7 +348,7 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                  "score" : True
                  },
              sentiment_batch_size: int = 100,
-             st: str = '2014-01-01',
+             st: str = '2004-01-01',
              end: str = '2026-01-01',
              tickers: list[str] | tuple[str] = ['GAZP', 'YNDX', 'NVTK', 'SBER', 'VTBR', 'LKOH',
                                                 'GMKN', 'NLMK', 'MGNT', 'AFKS', 'AFLT', 'MTSS',
@@ -371,20 +380,6 @@ class Joint_Dataset(Abstract_Fin_Dataset):
 
         pd.DataFrame(columns=['date', 'text']).to_csv(self.unified_filepath,
                                                       header=True)
-        if os.path.exists('checkpoint.pkl'):
-            with open('checkpoint.pkl', 'rb') as file:
-                checkpoint: dict[str, int] = pickle.load(file)
-        else:
-            checkpoint = {'load_func' : 0,
-                          'data_path' : 0,
-                          'df' : 0,
-                          'dt' : 0
-                          }
-
-        def save_checkpoint() -> None:
-            with open('checkpoint.pkl', 'wb') as file:
-                pickle.dump(checkpoint, file)
-            return None
 
         total_nans = 0
 
@@ -501,8 +496,6 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                                   ).drop(columns=[col])
 
         df_stock = df_new.dropna(axis=0, how='any').reset_index(drop=True)
-        print(df_new.shape)
-        print(df_new.head())
         self.num_elements = len(df)
         df_stock.to_csv(self.unified_filenm)
         self.columns = df_stock.columns.to_list()
@@ -537,8 +530,10 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                     self.df.iloc[cutoff:, :].drop(columns=['sentiment', 'TRADEDATE'])
 
         cols = train.columns
-        train = pd.DataFrame(data=pipe.fit_transform(train), columns=cols)
-        test = pd.DataFrame(data=pipe.transform(test), columns=cols)
+        train = pd.DataFrame(data=pipe.fit_transform(train))
+        test = pd.DataFrame(data=pipe.transform(test))
+
+        #print(train.head(), test.head())
 
         self.df = pd.concat([train, test], axis=0).reset_index(drop=True)
         self.df = pd.concat([self.df, redundant], axis=1)
@@ -563,6 +558,9 @@ class Joint_Dataset(Abstract_Fin_Dataset):
                                                                                 'sentiment']
                                                                                                               ).to_numpy().astype(float)
 
+        #print(x)
+        #print(x.shape)
+
         y = self.df.iloc[real_idx: real_idx + self.horizon, :].drop(columns=['TRADEDATE',
                                                                               'sentiment']
                                                                      ).to_numpy().astype(float)
@@ -571,7 +569,28 @@ class Joint_Dataset(Abstract_Fin_Dataset):
         x, y = torch.Tensor(x),torch.Tensor(y)
 
         return sentiment, x, y
-       
+
+class PatchTST(nn.Module):
+    
+    def __init__(self, config: PatchTSTConfig):
+        super().__init__()
+        self.model = PatchTSTForPrediction(config)
+        self.prediction_length = config.prediction_length
+        self.num_features = config.num_input_channels
+
+    def forward(self,
+                time_series_inputs: torch.Tensor,
+                sentiment: torch.Tensor = None
+                ) -> torch.Tensor:
+        '''
+        time_series_inputs: (batch_size, seq_len, num_features)
+        sentiment: ignored, kept for API compatibility
+        Returns: (batch_size, prediction_length, num_features)
+        '''
+        outputs = self.model(time_series_inputs)
+        return outputs.prediction_outputs
+
+
 class Sentiment_Model(nn.Module, ABC):
 
     def __init__(self,
@@ -635,7 +654,7 @@ class Quantum_Encoder(nn.Module):
     def __init__(self,
                  encoder_type: str = 'Amplitude',
                  wires: Iterable | None = None,
-                 device: str = 'default.qubit',
+                 device: str = None,
                  pad_val: complex = 0,
                  out: bool = False,
                  n_layers: int = 1,
@@ -657,6 +676,9 @@ class Quantum_Encoder(nn.Module):
 
         #TODO: add assert statements
 
+        if device is None:
+            device = 'lightning.gpu' if torch.cuda.is_available() else 'lightning.qubit'
+
         super().__init__()
 
         if isinstance(cfg, dict):
@@ -672,8 +694,9 @@ class Quantum_Encoder(nn.Module):
             self.encoder_type = encoder_type
             self.pad_val = pad_val
             self.out = out
-            self.circuit: Callable = None
-            self.weights_shape: tuple | None = None
+        self.circuit: Callable = None
+        self.weights_shape: tuple | None = None
+        self.weights = None
 
         self.dev = qml.device(self.device, wires=self.wires) 
 
@@ -687,7 +710,7 @@ class Quantum_Encoder(nn.Module):
             case 'Phase':
                
                 self.weights_shape = (self.n_layers, len(self.wires))
-
+                
             case 'QAOA':
 
                 self.weights_shape: tuple[int] = qml.QAOAEmbedding.shape(n_layers=self.n_layers,
@@ -696,117 +719,51 @@ class Quantum_Encoder(nn.Module):
 
             case _:
                 raise NotImplementedError
- 
 
-    def _init_circuit(self,
-                     weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] | str = None
-                     ) -> Callable:
-        ''' 
-        
-        Initialize the circuit for the embedding
-        
-        Inputs:
-            None
+    def _init_circuit(self, weights=None):
+        if weights is not None:
+            self.weights = nn.Parameter(weights)
+        else:
+            self.weights = None
 
-        Outputs:
-            circuit
-        
-        '''
+        @qml.batch_params
+        @qml.qnode(self.dev, interface='torch')
+        def circuit(features, weights):
+            feat = features
+            
+            if len(feat) > len(self.wires):
+                feat = feat[:len(self.wires)]
+            elif len(feat) < len(self.wires):
+                feat += [0.0] * (len(self.wires) - len(feat))
 
-        pad_features: Callable[[Iterable, Iterable, int | float], list] = lambda features, wires, pad_val: list(features) + [pad_val]*(len(wires) - len(features))
-    
-
-        def cond_decorator(condition:bool,
-                       decorator: Callable[[Callable], Callable]
-                       ) -> Callable[[Any], Any]:
-            '''
-            Made to call the qml.qnode decorator conditionally
-            '''
-
-
-            if condition:
-                return decorator
+            if self.encoder_type == 'Amplitude':
+                qml.AmplitudeEmbedding(feat, wires=self.wires, pad_with=self.pad_val)
+            elif self.encoder_type == 'Phase':
+                qml.AngleEmbedding(feat, wires=self.wires, rotation='Z')
+            elif self.encoder_type == 'QAOA':
+                qml.QAOAEmbedding(feat, weights, self.wires)
             else:
-                return lambda x: x 
-
-
-        match self.encoder_type:
-
-            case 'Amplitude':
-                
-                self.embed_size = 1 << len(bin(len(self.wires)).split('b')[-1])
-
-                assert bin(self.embed_size).split('b')[-1].count('1') == 1, "self.embed_size is not a power of 2"
-
-                #here weights are for compatibility, they don't serve any meaningful purpose
-                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
-                def circuit(features: Sequence,
-                            weights: Annotated[torch.Tensor, ('n_layers', 'custom_val')] = None,
-                            pad_val: complex = self.pad_val,
-                            **kwargs
-                            ) -> torch.Tensor:
-
-                    if weights is None:
-                        weights = nn.Parameter(torch.randn(self.weights_shape))
-
-                    qml.AmplitudeEmbedding(features,
-                                           wires=self.wires,
-                                           pad_with=pad_val,
-                                           **kwargs
-                                           )
-                    if self.out:
-                        return qml.state()
-                    else:
-                        return None
-            
-            case 'Phase':
-               
-                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
-                def circuit(features: Sequence,
-                            weights: str = 'Z', #consider it a hyperparameter
-                            ) -> torch.Tensor:
-
-                    features = pad_features(features, self.wires, self.pad_val)
-                    qml.AngleEmbedding(features, self.wires, rotation=weights)
-                   
-                    if self.out:
-                        return qml.state()
-                    else:
-                        return None
-            
-                    
-
-            case 'QAOA':
-     
-                @cond_decorator(self.out, qml.qnode(self.dev, interface='torch'))
-                def circuit(features : Sequence,
-                            weights: Annotated[torch.Tensor, ('n_layers', Literal['1', '3', '2*n_qubits'])] |\
-                                        None = weights, 
-                            **kwargs
-                            ) -> torch.Tensor:
-
-                    if weights is None:
-                        weights = nn.Parameter(weights)
-
-                    features = pad_features(features, self.wires, self.pad_val) 
-                    qml.QAOAEmbedding(features, weights, self.wires, **kwargs)
-                    
-                    if self.out:
-                        return qml.state()
-                    else:
-                        return None
-
-            case _:
-
                 raise NotImplementedError
 
-        self.circuit = circuit
+            if self.out:
+                return qml.state()
+            else:
+                return None
 
+        self.circuit = circuit
         return circuit
 
     def forward(self, features):
         if self.circuit:
-            return self.circuit(features)
+            if features.dim() == 2:
+                batch_size = features.size(0)
+                outputs = []
+                for i in range(batch_size):
+                    out = self.circuit(features[i], self.weights)   
+                    outputs.append(out)
+                return torch.stack(outputs, dim=0)
+            else:
+                return self.circuit(features, self.weights)
         else:
             raise ValueError("Circuit wasn't initialized")
 
@@ -850,52 +807,234 @@ class Quantum_Kernel(nn.Module):
         self.weights_shape = self.mapping[self.layer_type].shape(n_layers=self.n_layers,
                                                                  n_wires=len(self.wires)
                                                                 )
-    def _init_circuit(self,
-                      kernel_weights: Annotated[torch.Tensor, ('n_layers', 'n_wires', 3)] |\
-                                        Annotated[[
-                                                Annotated[torch.Tensor,
-                                                          'n_wires'],
-                                                Annotated[torch.Tensor,
-                                                          ('n_layers',
-                                                          'n_wires - 1',
-                                                          '2')]
-                                                ],
-                                            ('angles for the layer of Pauli-Y rotations',
-                                            'weights for each layer')
-                                            ],
-                      encoder_weights: torch.Tensor | str | None = None
-                      ) -> Callable:
+    def _init_circuit(self, kernel_weights=None, encoder_weights=None):
+        if kernel_weights is not None:
+            self.kernel_weights = nn.Parameter(kernel_weights)
+        
+        if encoder_weights is not None and self.encoder is not None:
+            self.encoder_weights = nn.Parameter(encoder_weights)
+            self.encoder._init_circuit(self.encoder_weights)
 
-        #TODO: update for SimplifiedTwoDesign compatibility
-        layer_config = {'weights' : kernel_weights,
-                        'wires' : self.encoder.wires if self.encoder else self.wires
-                        }
-
-        if self.encoder is not None:
-            self.encoder_circuit = self.encoder._init_circuit(encoder_weights)
-
+        @qml.batch_params
         @qml.qnode(self.dev, interface='torch')
-        def circuit(features: Sequence) -> np.ndarray | torch.Tensor:
-           
-            self.encoder_circuit(features)
-
-            #here the number of layers is within the shape of the weights tensor
-            self.mapping[self.layer_type](**layer_config)
-                        
-            return qml.state() #TODO:change to be more flexible
+        def circuit(features, encoder_weights, kernel_weights):
+            if self.encoder is not None:
+                if encoder_weights is not None:
+                    self.encoder.circuit(features, encoder_weights)
+                else:
+                    self.encoder.circuit(features)
+            if kernel_weights is not None:
+                self.mapping[self.layer_type](kernel_weights, wires=self.wires)
+            else:
+                self.mapping[self.layer_type](wires=self.wires)
+            res = [qml.expval(qml.PauliZ(w)) for w in self.wires]
+            return res
 
         self.circuit = circuit
-
-        return self.circuit
+        return circuit
 
     def forward(self,
-                features: Sequence
+                features: Sequence,
+                sentiment
                 ) -> torch.Tensor:
     
-        if not hasattr(self, 'encoder_circuit'):
-            print('Initializing without encoder...')
+        if features.dim() == 2:
+            batch_size = features.size(0)
+            outputs = []
+            for i in range(batch_size):
+                out = self.circuit(features[i],
+                                   self.encoder_weights,
+                                   self.kernel_weights
+                                   )
+                out = torch.stack(out)
+                outputs.append(out)
+            return torch.stack(outputs, dim=0)
+        else:
+            return self.circuit(features,
+                                self.encoder_weights,
+                                self.kernel_weights
+                                )
 
-        return self.circuit(features)
+
+
+class QuantumCircuit(nn.Module):
+    '''
+    Unified quantum module that performs both encoding and variational processing.
+    '''
+    
+    def __init__(self,
+                 n_qubits: int,
+                 n_steps: int,
+                 horizon: int,
+                 batch_size: int,
+                 encoding_type: str = 'Phase',
+                 n_encoding_layers: int = 1,
+                 var_layer_type: str = 'StronglyEntanglingLayers',
+                 n_var_layers: int = 2,
+                 device: str = None,
+                 out: bool = False, 
+                 pad_val: complex = 0.0,
+                 apply_qft: bool = True,
+                 cfg: Optional[dict] = None):
+        """
+        Args:
+            n_qubits: number of qubits
+            encoding_type: 'Amplitude', 'Phase', or 'QAOA'
+            n_encoding_layers: number of layers for QAOA encoding (ignored for others)
+            var_layer_type: variational layer type
+            n_var_layers: number of variational layers
+            device: PennyLane device ('default.qubit', 'lightning.qubit', etc.)
+            out: if True, return full state vector, else expectation values
+            pad_val: padding value for amplitude encoding
+            cfg: optional dict to override attributes
+        """
+        
+        super().__init__()
+        
+        if cfg is not None:
+            self.__dict__.update(cfg)
+            return
+        
+        self.n_qubits = n_qubits
+        self.n_steps = n_steps
+        self.horizon = horizon
+        self.batch_size = batch_size
+        self.wires = range(n_qubits)
+        self.encoding_type = encoding_type
+        self.n_encoding_layers = n_encoding_layers
+        self.var_layer_type = var_layer_type
+        self.n_var_layers = n_var_layers
+        self.out = out
+        self.pad_val = pad_val
+        self.apply_qft = apply_qft
+        
+        if device is None:
+            device = 'lightning.gpu' if torch.cuda.is_available() else 'lightning.qubit'
+        self.device = device
+        self.dev = qml.device(device, wires=self.wires)
+        
+        # Determine weight shapes
+        self.encoder_weights_shape = None
+        
+        match self.encoding_type:
+
+            case 'Amplitude':
+
+                self.encoder_weights_shape = (self.batch_size, ) + tuple() #no weights here
+
+            case 'Phase':
+               
+                self.encoder_weights_shape = (self.batch_size, ) + (self.n_encoding_layers, len(self.wires))
+                
+            case 'QAOA':
+
+                self.encoder_weights_shape: tuple[int] = (self.batch_size, ) +\
+                                        qml.QAOAEmbedding.shape(n_layers=self.n_encoding_layers,
+                                                                n_wires=len(self.wires)
+                                                                )
+            case _:
+                raise NotImplementedError
+
+        var_layer_map = {
+            'StronglyEntanglingLayers': qml.StronglyEntanglingLayers,
+            'SimplifiedTwoDesign': qml.SimplifiedTwoDesign
+        }
+        if var_layer_type not in var_layer_map:
+            raise ValueError(f"Unsupported variational layer: {var_layer_type}")
+        
+        self.var_layer_fn = var_layer_map[var_layer_type]
+        
+        self.var_weights_shape = (self.batch_size, ) + self.var_layer_fn.shape(
+                                                                n_layers=n_var_layers,
+                                                                n_wires=n_qubits
+                                                                )
+        
+        self.circuit = None
+        self.encoder_weights = None
+        self.var_weights = None
+
+
+        if self.encoding_type == 'QAOA' and self.encoder_weights_shape:
+            self.encoder_weights = torch.randn(*self.encoder_weights_shape) * torch.pi
+
+        if self.var_weights_shape:
+            self.var_weights = torch.randn(*self.var_weights_shape) * torch.pi
+
+        self._init_circuit(self.encoder_weights, self.var_weights)
+    
+        self.proj = nn.Linear(self.batch_size, self.horizon)
+
+    def _init_circuit(self, encoder_weights=None, var_weights=None):
+        
+        if encoder_weights is not None:
+            self.encoder_weights = nn.Parameter(encoder_weights)
+        
+        if var_weights is not None:
+            self.var_weights = nn.Parameter(var_weights)
+        
+        @qml.batch_params
+        @qml.qnode(self.dev, interface='torch')
+        def circuit(features, enc_weights, var_weights):
+            
+            for step in range(self.n_steps):
+                step_feat = features[:, step, :]           # (batch_size, n_features)
+                step_feat = self._pad_features(step_feat)  # (batch_size, n_qubits)
+
+                if self.encoding_type == 'Amplitude':
+                    qml.AmplitudeEmbedding(step_feat, wires=self.wires,
+                                           pad_with=self.pad_val, normalize=True)
+                elif self.encoding_type == 'Phase':
+                    qml.AngleEmbedding(step_feat, wires=self.wires, rotation='Z')
+                
+                elif self.encoding_type == 'QAOA':
+                    qml.QAOAEmbedding(step_feat, enc_weights, wires=self.wires)
+                
+                else:
+                    raise NotImplementedError
+
+                if var_weights is not None:
+                    self.var_layer_fn(var_weights, wires=self.wires)
+                else:
+                    self.var_layer_fn(wires=self.wires)
+
+            if self.apply_qft:
+                qml.QFT(wires=self.wires)
+
+            return [qml.expval(qml.PauliZ(w)) for w in self.wires]    
+        
+        self.circuit = circuit
+
+    def _pad_features(self, x: torch.Tensor) -> torch.Tensor:
+        n_features = x.shape[-1]
+        if n_features > self.n_qubits:
+            return x[..., :self.n_qubits]
+        elif n_features < self.n_qubits:
+            pad = torch.zeros(*x.shape[:-1], self.n_qubits - n_features,
+                              dtype=x.dtype, device=x.device)
+            return torch.cat([x, pad], dim=-1)
+        return x
+
+
+    def forward(self, features: torch.Tensor, sentiment) -> torch.Tensor:
+        '''
+        Forward pass with batching support.
+        Args:
+            features: shape (batch_size, n_features) – features to encode.
+                      n_features can be different from n_qubits (will be padded/truncated).
+        Returns:
+            If out=False: shape (batch_size, n_qubits) – expectation values.
+            If out=True: shape (batch_size, 2**n_qubits) – state vector (complex).
+        '''
+        if self.circuit is None:
+            raise RuntimeError("Circuit not initialized. Call _init_circuit first.")
+        
+        expvals = self.circuit(features, self.encoder_weights, self.var_weights)
+        q_out = torch.stack(expvals, dim=1).float()
+
+        out = self.proj(q_out)
+        out = out.reshape(self.batch_size, self.horizon, self.n_qubits)
+        return out
+
 
 class TS_JOPA(nn.Module):
 
@@ -904,258 +1043,91 @@ class TS_JOPA(nn.Module):
                  time_series_config: dict,
                  quantum_model: nn.Module,
                  quantum_model_config: dict,
-                 quantum_dim: int,
-                 quantum_stride: int,
-                 quantum_depth: int, #depth of the circuit in operations
+                 n_qubits: int,                  
                  dim_post_quantum: int,
-                 max_quantum_register_size: int = 5, #max register size in qubits
                  batch_size: int = 32) -> None:
 
         super().__init__()
-
         self.batch_size = batch_size
         self.prediction_length = time_series_config.prediction_length
-        
-        if hasattr(time_series_config, 'hidden_dim'):
-            self.hidden_dim = time_series_config['hidden_dim']
-        else:
-            self.hidden_dim = -1
+        self.num_features = time_series_config.num_input_channels
+        self.n_qubits = n_qubits
+        self.hidden_dim = getattr(time_series_config, 'hidden_dim', -1)
 
-        #Time series model initialization
-        self.time_series_model = time_series_model(time_series_config) #init model with config
-        self.time_series_proj_dim = time_series_config.d_model #define the projection dim ,TODO: change to generalize the integration point
-        
+        self.time_series_model = time_series_model(time_series_config)
+        self.time_series_proj_dim = time_series_config.d_model
 
-        #Quantum model initialization
         self.quantum_model = quantum_model(cfg=quantum_model_config)
-        self.q_encoder_weights = nn.Parameter(
-                                    torch.randn(
-                                        self.quantum_model.encoder.weights_shape
-                                        )
-                                    )
-        print(self.quantum_model.weights_shape)
-        self.q_kernel_weights = nn.Parameter(torch.randn(self.quantum_model.weights_shape))
-        self.quantum_model._init_circuit(encoder_weights=self.q_encoder_weights,
-                                         kernel_weights=self.q_kernel_weights)
-        self.quantum_dim = quantum_dim
-        self.max_quantum_register_size = max_quantum_register_size
-        self.quantum_stride = quantum_stride
-        self.quantum_depth = quantum_depth
-        self.dim_post_quantum = dim_post_quantum
-        
+        encoder_weights = None
+        if self.quantum_model.encoder is not None:
+            if hasattr(self.quantum_model.encoder, 'weights_shape') and self.quantum_model.encoder.weights_shape:
+                encoder_weights = torch.pi * torch.randn(*self.quantum_model.encoder.weights_shape)
+        kernel_weights = None
+        if hasattr(self.quantum_model, 'weights_shape') and self.quantum_model.weights_shape:
+            kernel_weights = torch.pi * torch.randn(*self.quantum_model.weights_shape)
+        self.quantum_model._init_circuit(kernel_weights=kernel_weights, encoder_weights=encoder_weights)
 
-        #compare the number of qubits needed to fully encompass the embed dim vs the max allowed register size
-        self.n_qubits = min((1 << quantum_dim.bit_length()).bit_length() - 1,
-                            self.max_quantum_register_size)
-       
-        if self.n_qubits > self.max_quantum_register_size:
-            self.num_registers = range((1 << self.n_qubits) - 1, quantum_dim, quantum_stride)
-        else:
-            self.num_registers = 1
-
-        #self.quantum_model.mapping holds a mapping from the names of the layers to their pennylane classes
-        num_params_quantum_layer = self.quantum_model.mapping[self.quantum_model.layer_type].\
-                shape(n_wires=self.n_qubits,
-                      n_layers=1
-                      )
-
-        #post-quantum algorithm projection
-        self.post_q_proj = nn.Linear(1 << self.n_qubits,
-                                     self.time_series_proj_dim
-                                     )
-
+        self.post_q_proj = nn.Linear(n_qubits, self.time_series_proj_dim)
         self.out_proj = nn.Linear(self.time_series_proj_dim,
-                                  time_series_config.prediction_length * num_features
-                                  )
+                                  time_series_config.prediction_length * self.num_features)        
 
-    def forward(self,
-                time_series_inputs: Annotated[torch.Tensor,
-                                              ('batch_size',
-                                               'n_time_steps',
-                                               'time_series_dim'
-                                               )
-                                              ],
-                sentiment: Annotated[torch.Tensor,
-                                       ('batch_size',
-                                        1
-                                        )
-                                       ]
-                ) -> torch.Tensor:
-        '''
-        time_series_inputs: Annotated[torch.Tensor,
-                                              ('batch_size',
-                                               'n_time_steps',
-                                               'time_series_dim'
-                                               )
-                                              ] - time series tensor
-        sentiment: Annotated[torch.Tensor,
-                                       ('batch_size',
-                                        1
-                                        )
-                                       ] - sentiment values
-        '''
-        
+
+    def forward(self, time_series_inputs, sentiment):
         sentiment = sentiment.reshape(-1, 1)
+        ts_out = self.time_series_model(time_series_inputs).hidden_states[self.hidden_dim]
+        ts_out_agg = ts_out.mean(dim=(1, 2))
+        combined = ts_out_agg * sentiment
 
-        ts_out = self.time_series_model(time_series_inputs).hidden_states[self.hidden_dim] #(batch, n_patches, embed_size, d_model)
-        ts_out_agg = ts_out.mean(dim=(1,2))
-        #print(f'Time-series embeds: {ts_out_agg.shape}')
-        #print(sentiment.shape)
+        if combined.shape[1] < self.n_qubits:
+            combined_q = F.pad(combined, (0, self.n_qubits - combined.shape[1]), value=0.0)
+        else:
+            combined_q = combined[:, :self.n_qubits]
 
-        combined = (ts_out_agg * sentiment)
-        
-        #print(combined.shape)
+        norms = combined.norm(dim=1, keepdim=True) + 1e-8
+        combined = combined / norms * (2 * torch.pi)
 
-        if combined.shape[1] < self.quantum_dim:
-
-            combined = F.pad(combined,
-                             pad=(0, self.quantum_dim - combined.shape[1]),
-                             mode='constant',
-                             value=0)
-        
-        #print(combined.shape)
-        
-        q_outs = [] #quantum_registers' outputs
-        for idr, register in enumerate(
-                                        range(0,
-                                              self.num_registers,
-                                              self.quantum_stride
-                                              )
-                                       ):
-            to_encode = combined[:,
-                                 idr : min(combined.shape[1],
-                                              idr+(1 << self.max_quantum_register_size)
-                                                )
-                                 ]
-            magnitudes = to_encode.norm(p=2, dim=1, keepdim=True)
-
-            to_encode = F.normalize(to_encode,
-                                    p=2,
-                                    dim=1
-                                    )*2*np.pi #normalize to [0, 2pi] to encode
-            
-            #print(to_encode.shape)
-            q_outs.append(self.quantum_model.forward(to_encode)*magnitudes)
-
-        q_outs = torch.cat(q_outs, dim=1).float()
-        #print(f'q_outs: {q_outs.shape}') #(batch, )
-        #print(q_outs.dtype)
-
-        post_q_outs = self.post_q_proj(q_outs)
-        #print(f'post_q_outs: {post_q_outs.shape}')
-        out = self.out_proj(post_q_outs).view(-1, self.prediction_length, num_features) # (batch, 10, 8)
-        #print(f'out: {out.shape}')
+        q_out = self.quantum_model(combined).real.float() * norms / (2* torch.pi)# (batch, n_qubits)
+        post_q = self.post_q_proj(q_out)               # (batch, d_model)
+        out = self.out_proj(post_q).view(-1, self.prediction_length, self.num_features)
         return out
 
 
-if __name__ == '__main__':
+def train(dataset: torch.utils.data.Dataset,
+          mdl: nn.Module,
+          batch_size: int = 32,
+          criterion = nn.MSELoss(),
+          num_epochs: int = 10,
+          train_pct: float = .8
+          ) -> None:
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_pct = .8
-    num_epochs = 100
-    batch_size = 32
-    seq_len = 10               # time series sequence length
-    num_features = 4*21 #channels per stock \times num_stocks
-    prediction_length = 10
-    d_model = 8                # hidden dimension for PatchTST
-
-    # Time series config (PatchTST)
-    time_series_config = PatchTSTConfig(
-        context_length=seq_len,
-        prediction_length=prediction_length,
-        d_model=d_model,
-        num_input_channels=num_features,
-        patch_length=5,
-        num_attention_heads=2,
-        num_hidden_layers=1,
-        output_hidden_states=True
-    )
-
-    # Quantum model parameters
-    quantum_dim = 15
-    quantum_stride = 2
-    quantum_depth = 1
-    dim_post_quantum = d_model
-    max_quantum_register_size = 5
-
-    quantum_model_config = {
-        'layer_type' : 'StronglyEntanglingLayers',
-        'n_layers' : 10,
-        'wires': range(4),
-        'layer_config': None,
-        'encoder': Quantum_Encoder,
-        'device': 'default.qubit',
-        'uncorr_wires': (),
-        'encoder_config' : {'embed_size' : quantum_dim,
-                            'encoder_type' : 'Amplitude',
-                            'wires' : range(4),
-                            'device' : 'default.qubit',
-                            'pad_val' : 0,
-                            'n_layers' : 2,
-                            'out' : True
-                            }
-        }
-
-    
-
-    combined_model = TS_JOPA(
-        time_series_model=PatchTSTForPrediction,
-        time_series_config=time_series_config,
-        quantum_model=Quantum_Kernel,
-        quantum_model_config=quantum_model_config,
-        quantum_dim=quantum_dim,
-        quantum_stride=quantum_stride,
-        quantum_depth=quantum_depth,
-        dim_post_quantum=dim_post_quantum,
-        max_quantum_register_size=max_quantum_register_size
-    ).to(device)
-
-    sentiment_cfg = {
-            "model_name": "ProsusAI/finbert",
-            "num_labels": 3,                  
-            "device": "cuda" if torch.cuda.is_available() else 'cpu',
-            "score" : True
-            }
-
-
-    full_dataset = Joint_Dataset(lookback=seq_len,
-                                 horizon=prediction_length,
-                                 load_from_file=True,
-                                 unified_filenm='preprocessed_data.csv') 
-
-    pipe = Pipeline([('scaler', StandardScaler())])
-
-    full_dataset.transform(pipe, train_pct)
-
-    cutoff = int(train_pct*len(full_dataset))
+    cutoff = int(train_pct*len(dataset))
 
     train_indices = list(range(cutoff))
-    test_indices = list(range(cutoff, len(full_dataset)))
+    test_indices = list(range(cutoff, len(dataset)))
 
-    train_dataset = Subset(full_dataset, train_indices)
-    test_dataset  = Subset(full_dataset, test_indices)
-    
+    train_dataset = Subset(dataset, train_indices)
+    test_dataset  = Subset(dataset, test_indices)
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    optimizer = torch.optim.Adam(combined_model.parameters(),
-                                 lr=1e-2
+
+    optimizer = torch.optim.AdamW(mdl.parameters(),
+                                  lr=1e-4,
+                                  weight_decay=1e-5
                                  )
-    
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
                                                            mode='min',
                                                            patience=3,
                                                            factor=0.5
                                                            )
-    criterion = nn.MSELoss()
-
     best_test_loss = float('inf')
     patience_counter = 0
-    early_stop_patience = 5
+    early_stop_patience = 10
 
     for epoch in range(num_epochs):
 
-        combined_model.train()
+        mdl.train()
         train_loss = 0.0
         train_loop = tqdm(train_loader,
                           desc=f'Epoch {epoch+1}/{num_epochs} [Train]',
@@ -1169,19 +1141,15 @@ if __name__ == '__main__':
                                             inputs.to(device),\
                                             targets.to(device)
 
-    
+
+
             optimizer.zero_grad()
-            outputs = combined_model(inputs, sentiment)
-            #print(f"Forward output shape: {output.shape}")   # (batch, prediction_length)
-            #print(f'Target shape: {targets.shape}')
+            outputs = mdl(inputs, sentiment)
             loss = criterion(outputs, targets)
             loss.backward()
-            #print("Backward pass completed. Gradients exist:", any(
-            #    p.grad is not None for p in combined_model.parameters()
-            #))
 
             #gradient clipping 
-            #torch.nn.utils.clip_grad_norm_(combined_model.parameters(), max_norm=1.0)
+            #torch.nn.utils.clip_grad_norm_(mdl.parameters(), max_norm=1.0)
 
             optimizer.step()
             train_loss += loss.item() * inputs.size(0)
@@ -1193,7 +1161,7 @@ if __name__ == '__main__':
             avg_train_loss = train_loss / len(train_loader.dataset)
         
             #check on test
-            combined_model.eval()
+            mdl.eval()
             test_loss = 0.0
             with torch.no_grad():
                 test_loop = tqdm(test_loader,
@@ -1202,7 +1170,7 @@ if __name__ == '__main__':
 
                 for sentiment, inputs, targets in test_loop:
                     sentiment, inputs, targets = sentiment.to(device), inputs.to(device), targets.to(device)
-                    outputs = combined_model(inputs, sentiment)
+                    outputs = mdl(inputs, sentiment)
                     loss = criterion(outputs, targets)
                     test_loss += loss.item() * inputs.size(0)
                     test_loop.set_postfix(loss=loss.item())
@@ -1210,30 +1178,291 @@ if __name__ == '__main__':
             avg_test_loss = test_loss / len(test_loader.dataset)
             scheduler.step(avg_test_loss)
             
-            print(f'Epoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, Test Loss = {avg_test_loss:.6f}')
+            print(f'\rEpoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, Test Loss = {avg_test_loss:.6f}')
             
 
             if (epoch + 1) % 5 == 0:
                 checkpoint = {
                     'epoch': epoch + 1,
-                    'model_state_dict': combined_model.state_dict(),
+                    'model_state_dict': mdl.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': avg_test_loss,
                 }
                 torch.save(checkpoint, f"checkpoint_epoch_{epoch+1}.pth")
 
+    
             # early stopping
             if avg_test_loss < best_test_loss:
                 best_test_loss = avg_test_loss
-                torch.save(combined_model.state_dict(), 'best_model.pth')
+                torch.save(mdl.state_dict(), 'best_model.pth')
                 patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= early_stop_patience:
-                    print("Early stopping triggered.")
+                    print("\nEarly stopping triggered.")
                     break
 
-            continue
-        break
 
     print("Training complete. Best test loss:", best_test_loss)
+    return None
+
+
+class LogReturnsTransformer(BaseEstimator, TransformerMixin):
+    """Compute log returns for OHLC columns."""
+    def __init__(self, cols: Iterable = ['OPEN', 'HIGH', 'LOW', 'CLOSE']):
+        self.cols = cols
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        nms = set([col.split('_')[0] for col in X.columns])
+        for nm in nms:
+            for col in self.cols:
+                X[f'{nm}_{col}'] = np.log(X[f'{nm}_{col}'] / X[f'{nm}_{col}'].shift(1))
+        # Drop the first row (NaN from shift)
+        X = X.fillna(0)#X.iloc[1:].reset_index(drop=True)
+        return X
+
+
+class SpreadTransformer(BaseEstimator, TransformerMixin):
+    """Add ratio features: High/Low, Close/Open."""
+    def transform(self, X):
+        X = X.copy()
+        nms = set([col.split('_')[0] for col in X.columns])
+        for nm in nms:
+            X[f'{nm}_HIGH_LOW_ratio'] = X[f'{nm}_HIGH'] / X[f'{nm}_LOW']
+            X[f'{nm}_CLOSE_OPEN_ratio'] = X[f'{nm}_CLOSE'] / X[f'{nm}_OPEN']
+        return X
+
+    def fit(self, X, y=None):
+        return self
+
+
+class TypicalPriceTransformer(BaseEstimator, TransformerMixin):
+    """Add typical price = (High + Low + Close)/3."""
+    def transform(self, X):
+        X = X.copy()
+        nms = set([col.split('_')[0] for col in X.columns])
+        for nm in nms:
+            X[f'{nm}_Typical'] = (X[f'{nm}_HIGH'] + X[f'{nm}_LOW'] + X[f'{nm}_CLOSE']) / 3.0
+        return X
+
+    def fit(self, X, y=None):
+        return self
+
+
+class RollingRSITransformer(BaseEstimator, TransformerMixin):
+    """Add RSI (Relative Strength Index) with a given window."""
+    def __init__(self, window=14, col='Close'):
+        self.window = window
+        self.col = col
+
+    def transform(self, X):
+        X = X.copy()
+        delta = X[self.col].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=self.window, min_periods=self.window).mean()
+        avg_loss = loss.rolling(window=self.window, min_periods=self.window).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        X[f'RSI_{self.window}'] = rsi
+        # First 'window' rows will be NaN – we will drop them later
+        return X
+
+    def fit(self, X, y=None):
+        return self
+
+
+class Quantum_feature_map(BaseEstimator):
+    def __init__(self,
+                 MI_threshold=2.5,
+                 n_qubits=4
+                 ) -> None:
+
+        self.MI_th = MI_threshold
+        self.n_qubits = n_qubits
+        self.device = 'default.qubit'
+
+    def fit(self, X, y=None):
+        X = np.array(X)
+        n_features = X.shape[1]
+
+        MI = np.zeros((n_features, n_features))
+        for i in range(n_features):
+            MI[:, i] = mutual_info_regression(X, X[:, i])
+
+        #print(MI)
+
+        groups = []
+        for i, j in combinations(range(n_features), 2):
+            if (MI[i, j] >= self.MI_th or MI[j, i] >= self.MI_th) and i != j:
+                groups.append((i, j))
+
+        self.groups_ = groups
+        self.params_ = [MI[gr] for gr in groups]
+
+        dev = qml.device(self.device, wires=self.n_qubits)
+
+        @qml.qnode(dev)
+        def circuit(inputs):
+            for i in range(min(len(inputs), self.n_qubits)):
+                qml.RX(inputs[i], wires=i)
+            
+            for i in range(self.n_qubits):
+                qml.Hadamard(wires=i)
+            
+            for group, angle in zip(self.groups_, self.params_):
+                qml.CRZ(angle, wires=group)
+
+            qml.QFT(wires=range(self.n_qubits))
+            
+            return [qml.expval(qml.PauliZ(w)) for w in range(self.n_qubits)] 
+
+        self.circuit_ = circuit
+        return self
+
+    def transform(self, X):
+        X = np.array(X)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        out = np.zeros((X.shape[0], self.n_qubits))
+        for idx in range(X.shape[0]):
+            # Store the quantum output
+            out[idx] = self.circuit_(X_scaled[idx])
+
+        # Inverse transform to original scale (optional)
+        X_new = scaler.inverse_transform(out)
+        return X_new
+
+if __name__ == '__main__':
+
+    n_stocks = 1
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    train_pct = .8
+    num_epochs = 10
+    batch_size = 32
+    seq_len = 10               # time series sequence length
+    num_features = 4*n_stocks  #4*5 #channels per stock \times num_stocks
+    prediction_length = 10
+    d_model = 8                # hidden dimension for PatchTST
+    num_hidden_layers = 2
+    dropout= .2              
+    head_dropout= .2
+    
+
+    # Time series config (PatchTST)
+    time_series_config = PatchTSTConfig(
+        context_length=seq_len,
+        prediction_length=prediction_length,
+        d_model=d_model,
+        num_input_channels=num_features,
+        patch_length=5,
+        num_attention_heads=2,
+        num_hidden_layers=num_hidden_layers,
+        dropout=dropout,
+        head_dropout=head_dropout,
+        output_hidden_states=True
+    )
+
+    # Quantum model parameters
+    n_qubits = 4
+    dim_post_quantum = d_model
+
+    quantum_model_config = {
+        'layer_type': 'StronglyEntanglingLayers',
+        'n_layers': 4,
+        'wires': range(n_qubits),
+        'layer_config': None,
+        'encoder': Quantum_Encoder,
+        'device': 'default.qubit',
+        'uncorr_wires': (),
+        'encoder_config': {
+            'encoder_type': 'Phase',
+            'wires': range(n_qubits),
+            'device': 'default.qubit',
+            'n_layers': 2,
+            'out': True
+        }
+    }
+
+    combined_model = TS_JOPA(
+        time_series_model=PatchTSTForPrediction,
+        time_series_config=time_series_config,
+        quantum_model=Quantum_Kernel,
+        quantum_model_config=quantum_model_config,
+        n_qubits=n_qubits,                    
+        dim_post_quantum=dim_post_quantum,
+        batch_size=batch_size
+    ).to(device)
+
+    full_dataset = Joint_Dataset(lookback=seq_len,
+                                 horizon=prediction_length,
+                                 load_from_file=True,
+                                 unified_filenm=f'preprocessed_data_{n_stocks}_stocks.csv') 
+
+    pipe = Pipeline([
+        #('QMI', Quantum_feature_map(n_qubits=num_features, MI_threshold=2.)),
+        #('log_returns', LogReturnsTransformer()),
+        #('spreads', SpreadTransformer()),
+        #('typical', TypicalPriceTransformer()),
+        #('rsi', RollingRSITransformer(window=14, col='CLOSE')),
+        #('scaler', StandardScaler()),
+        #('PCA', PCA(n_components=num_features)),
+        ('scaler_2', StandardScaler()),
+    ])
+
+
+    full_dataset.transform(pipe, train_pct)
+
+    benchmark_model = PatchTST(time_series_config)
+
+    quantum_model = QuantumCircuit(
+        n_qubits=n_qubits,
+        n_steps=seq_len,
+        horizon=prediction_length,
+        batch_size=batch_size,
+        encoding_type='QAOA',
+        var_layer_type='StronglyEntanglingLayers',
+        n_var_layers=2,
+        device='default.qubit'
+    )
+    
+    encoder_weights = None
+    var_weights = torch.randn(*quantum_model.var_weights_shape) * torch.pi
+    quantum_model._init_circuit(encoder_weights=encoder_weights, var_weights=var_weights)    
+
+    criterion=nn.MSELoss()
+
+    train(full_dataset,
+          quantum_model,
+          batch_size,
+          criterion=criterion,
+          num_epochs=num_epochs,
+          train_pct=train_pct
+          ) 
+
+    '''
+
+
+    train(full_dataset,
+          benchmark_model,
+          batch_size,
+          criterion=criterion,
+          num_epochs=num_epochs,
+          train_pct=train_pct
+          )
+    '''
+
+
+    '''
+    train(full_dataset,
+          combined_model,
+          batch_size,
+          criterion=criterion,
+          num_epochs=num_epochs,
+          train_pct=train_pct)
+    '''
